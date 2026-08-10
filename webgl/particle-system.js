@@ -1,3 +1,4 @@
+
 import * as THREE from './lib/three.js';
 import { particleVertex, particleFragment } from './shaders/particles.js';
 import { PALETTE } from './chapters.js';
@@ -6,6 +7,8 @@ import { makeRng, clamp } from './lib/random.js';
 
 const IDENTITY = new THREE.Matrix3();
 
+// A formation can be authored tilted. Baking the rotation into a matrix here
+// keeps it out of the shader's inner loop, where it would cost per particle.
 function tiltMatrix(tilt) {
   if (!tilt) return IDENTITY.clone();
   const m4 = new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(
@@ -22,10 +25,16 @@ export class ParticleSystem {
     this.registry = registry;
     this.count = count;
 
+    // One fixed random number per particle, uploaded once and never changed.
+    // The shader uses it to de-synchronise everything that would otherwise move
+    // in lockstep: twinkle phase, noise offset, flight path bend.
     const rng = makeRng(0x0ff1ce);
     const seeds = new Float32Array(count);
     for (let i = 0; i < count; i++) seeds[i] = rng.unit();
 
+    // DynamicDrawUsage tells the driver these buffers will be rewritten, so it
+    // places them in memory it can update cheaply. The contents are only ever
+    // replaced wholesale by _load, never edited in place.
     const makeSlot = () => {
       const pos = new THREE.BufferAttribute(new Float32Array(count * 3), 3);
       const attr = new THREE.BufferAttribute(new Float32Array(count * 4), 4);
@@ -39,9 +48,16 @@ export class ParticleSystem {
         touch: { mode: 0, radius: 7, strength: 1.2 },
       };
     };
+    // Three cached point clouds. Two are bound as the morph pair, the
+    // third stays free so the next chapter can be prefetched into it.
+    //
+    // Three is the smallest number that works: with two, scrolling into a new
+    // chapter would always evict the slot the chapter after it is about to need.
     this.slots = [makeSlot(), makeSlot(), makeSlot()];
     this.aIndex = 0;
     this.bIndex = 1;
+    // Monotonic counter stamped onto a slot whenever it is bound, so `used`
+    // orders the slots by how recently they mattered.
     this.tick = 0;
     this.pendingB = null;
 
@@ -56,7 +72,7 @@ export class ParticleSystem {
       uClockA: { value: 0 },
       uClockB: { value: 0 },
       uSize: { value: 1 },
-      uPixelRatio: { value: 1 },
+      uSizeScale: { value: 1 },
       uNoise: { value: 0.5 },
       uNoiseScale: { value: 0.04 },
       uNoiseSpeed: { value: 0.05 },
@@ -98,6 +114,13 @@ export class ParticleSystem {
       uPointerGain: { value: 0 },
     };
 
+    /* Additive blending with depth switched off entirely.
+
+       Additive means overlapping particles sum toward white, which is what makes
+       dense regions glow instead of just stacking opaque dots. Depth testing has
+       to go with it: additive blending is order-independent (a + b == b + a), so
+       sorting buys nothing, and depth WRITES would actively break it by letting
+       a near particle mask the ones behind that should be adding to it. */
     this.material = new THREE.ShaderMaterial({
       uniforms: this.uniforms,
       vertexShader: particleVertex,
@@ -109,6 +132,9 @@ export class ParticleSystem {
     });
 
     this.points = new THREE.Points(this.geometry, this.material);
+    // Culling is pointless here and would be wrong: the bounding box three
+    // computes is of the un-morphed slot A, while the shader moves particles
+    // far outside it. Same for the matrix, which never changes from identity.
     this.points.frustumCulled = false;
     this.points.matrixAutoUpdate = false;
 
@@ -118,6 +144,10 @@ export class ParticleSystem {
     this._warmColor = new THREE.Color(PALETTE.warm).convertSRGBToLinear();
   }
 
+  // How the quality ladder cuts cost. The buffers stay at full size and only the
+  // draw range shrinks, so changing tier is free: no reallocation, no re-bake.
+  // Because the registry writes through a shuffle, the surviving prefix is a
+  // uniform random sample of the formation rather than one side of it.
   setActiveCount(n) {
     this.activeCount = clamp(Math.floor(n), 1024, this.count);
     this.geometry.setDrawRange(0, this.activeCount);
@@ -128,6 +158,7 @@ export class ParticleSystem {
     return -1;
   }
 
+  // Evict the least-recently-bound slot, never one that's live this frame.
   _acquire(exclude) {
     let best = -1;
     let bestUsed = Infinity;
@@ -141,6 +172,10 @@ export class ParticleSystem {
     return best === -1 ? 0 : best;
   }
 
+  // Copy a baked formation into a slot. This is the expensive operation in the
+  // file: three typed-array copies totalling about 3.2MB at 100k particles, plus
+  // the upload the driver does on next draw. Everything else here exists to
+  // avoid calling it at a bad moment.
   _load(index, id) {
     const slot = this.slots[index];
     if (slot.id === id) return;
@@ -160,6 +195,9 @@ export class ParticleSystem {
     slot.clock = 0;
   }
 
+  // Point the geometry at the two chosen slots and copy their per-formation
+  // metadata into uniforms. Rebinding an attribute is just a pointer swap, so
+  // this is cheap even though _load is not.
   _bind() {
     const A = this.slots[this.aIndex];
     const B = this.slots[this.bIndex];
@@ -180,6 +218,8 @@ export class ParticleSystem {
     this.uniforms.uTouchB.value.set(B.touch.radius, B.touch.strength, B.touch.mode);
   }
 
+  // Make idA and idB the bound pair, loading whatever is not already cached.
+  // Called every frame, so the already-correct case has to be free.
   setPair(idA, idB) {
     const boundA = this.slots[this.aIndex];
     const boundB = this.slots[this.bIndex];
@@ -189,11 +229,21 @@ export class ParticleSystem {
       return;
     }
 
+    // Prefer a slot that already holds the formation; only then evict. When both
+    // ids are the same (consecutive chapters sharing a scene) one slot serves as
+    // both ends of the pair and the morph is a no-op.
     let ai = this._find(idA);
     let bi = idA === idB ? ai : this._find(idB);
     if (ai < 0) ai = this._acquire(bi >= 0 ? [bi] : []);
     if (bi < 0) bi = idA === idB ? ai : this._acquire([ai]);
 
+    /* If both ends need loading, do not do both now. Two back-to-back copies of
+       3.2MB plus two uploads in one frame is a visible stall, and it lands
+       exactly when the user is scrolling fast enough to have outrun the
+       prefetch. Load A, defer B to the top of the next frame.
+
+       Deferring is safe because A is the formation currently on screen; B is
+       where the particles are heading and is not visible until morph leaves 0. */
     const needsA = this.slots[ai].id !== idA;
     const needsB = bi !== ai && this.slots[bi].id !== idB;
     this._load(ai, idA);
@@ -211,6 +261,10 @@ export class ParticleSystem {
     this._bind();
   }
 
+  // Warm the third slot with a formation nothing is using yet. Called from
+  // maybePrefetch once the scroll is far enough into a chapter to be confident
+  // which one comes next. Excluding both bound indices is what guarantees this
+  // can never evict something on screen.
   prefetch(id) {
     if (!id || this._find(id) >= 0) return false;
     const index = this._acquire([this.aIndex, this.bIndex]);
@@ -219,6 +273,7 @@ export class ParticleSystem {
   }
 
   update(state, dt, elapsed) {
+    // Pay off the load deferred by setPair last frame, before anything else.
     if (this.pendingB) {
       const { index, id } = this.pendingB;
       this.pendingB = null;
@@ -227,11 +282,21 @@ export class ParticleSystem {
     }
     this.setPair(state.sceneA, state.sceneB);
 
+    /* Each slot keeps its own animation clock rather than sharing elapsed time.
+
+       A formation that is not currently on screen must not keep spinning: it
+       would be at an arbitrary rotation when the morph reaches it, and particles
+       would arrive at positions that have drifted away from where they were
+       aimed. Per-slot clocks start at 0 on load and only advance while bound. */
     const rate = state.clockRate;
     for (let i = 0; i < this.slots.length; i++) {
       const slot = this.slots[i];
       if (slot.id === null) continue;
       let step = dt * rate;
+      // The wormhole tunnel is the one formation that reacts to scrolling: its
+      // flow speeds up, slows and reverses with the scroll, so travelling down
+      // the page feels like travelling down the tunnel. Clamped so a flick
+      // cannot fling it, and it keeps a baseline drift so it never fully stops.
       if (slot.mode === MODE.FLOW_Z && state.flowFromScroll > 0.01) {
         const bias = clamp(state.velocity * 0.004, -6, 6) * state.flowFromScroll;
         step = dt * (0.45 * rate + bias);
@@ -269,8 +334,21 @@ export class ParticleSystem {
     u.uFogTint.value = state.fogTint;
     u.uWarmRadius.value = A.warmRadius + (B.warmRadius - A.warmRadius) * state.morph;
 
+    // Motion streaks scale with the formation's own clock, so a scene that is
+    // barely turning does not smear as though it were.
     u.uStreak.value = (state.streak !== undefined ? state.streak : 0.55)
       * (state.clockRate !== undefined ? state.clockRate : 0.68);
+
+    /* How fast the morph itself is progressing, used to stretch particles along
+       their flight path. Two guards on the raw measurement:
+
+       |dm| < 0.5 rejects a discontinuity. morph is a remapped value, so it can
+       jump from 1 back to 0 when the chapter pair rolls over, and that is a
+       bookkeeping change rather than motion. `snapped` rejects the same thing
+       after an anchor jump.
+
+       Then it is smoothed, because the raw frame-to-frame difference is far too
+       noisy to drive a visual with directly. */
     const m = state.morph || 0;
     const dm = this._lastMorph === undefined ? 0 : m - this._lastMorph;
     const rawVel = (state.sceneA !== state.sceneB && Math.abs(dm) < 0.5 && !state.snapped)
@@ -280,6 +358,9 @@ export class ParticleSystem {
     this._morphVel = (this._morphVel || 0) + (rawVel - (this._morphVel || 0)) * Math.min(1, dt * 7);
     u.uMorphVel.value = this._morphVel * (state.streak !== undefined ? Math.min(1, state.streak * 1.4) : 0.8);
 
+    // Fog colour is a single 0..1 dial across the three-colour palette: neutral
+    // at 0, accent blue at the midpoint, warm at 1. Two lerps rather than one so
+    // it passes through accent rather than averaging past it.
     const mix = state.hazeMix;
     const fog = u.uFogColor.value;
     if (mix <= 0.5) fog.copy(this._neutral).lerp(this._accent, mix * 2);
@@ -290,14 +371,18 @@ export class ParticleSystem {
     this.uniforms.uOpacity.value = v;
   }
 
-  setPixelRatio(dpr) {
-    this.uniforms.uPixelRatio.value = dpr;
+  setSizeScale(scale) {
+    this.uniforms.uSizeScale.value = scale;
   }
 
   setViewport(w, h) {
     this.uniforms.uViewport.value.set(Math.max(1, w), Math.max(1, h));
   }
 
+  // The pointer as a ray in world space, not a screen position: the shader needs
+  // to know how close each particle is to the line the cursor is pointing along.
+  // `move` is the smoothed velocity of the ray's tip, which is what lets a flick
+  // push particles rather than merely a hover displacing them.
   setPointer(origin, dir, move, gain) {
     const u = this.uniforms;
     u.uPointerOrigin.value.copy(origin);
@@ -306,6 +391,8 @@ export class ParticleSystem {
     u.uPointerGain.value = gain;
   }
 
+  // The slot buffers are owned by the geometry and go with it. The baked
+  // formations themselves belong to the registry, which is disposed separately.
   dispose() {
     this.geometry.dispose();
     this.material.dispose();

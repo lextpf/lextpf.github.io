@@ -1,9 +1,12 @@
+
 import { TAU } from '../lib/random.js';
 import { BIPOLAR_PLUME } from '../lib/modes.js';
 import { allocate } from './sculpt.js';
 
 export const BIPOLAR_PLUME_SPIN = BIPOLAR_PLUME.spin;
 
+// `total` is split 62/38 between the diffuse body and the filaments, then evenly
+// across the two sides. Callers pass whatever budget they can spare.
 export function writeBipolarPlumes(c, total, {
   start = BIPOLAR_PLUME.start,
   end = BIPOLAR_PLUME.end,
@@ -20,7 +23,11 @@ export function writeBipolarPlumes(c, total, {
       const distance = start + (end - start) * t;
       const radius = 0.5 + Math.pow(t, 1.18) * 7.2;
       const angle = c.rng.unit() * TAU + side * t * 1.8;
+      // Power above 1 pulls particles toward the axis, so the jet has a dense
+      // spine and a soft edge rather than a uniformly filled cone.
       const radial = radius * Math.pow(c.rng.unit(), 1.45);
+      // Bow each plume sideways, peaking mid-length: a jet bent by its own
+      // rotation, rather than two straight spikes.
       const bend = side * Math.sin(t * Math.PI) * 2.3;
       const edgeFade = Math.sin(Math.PI * Math.min(1, t * 1.04));
       c.write(

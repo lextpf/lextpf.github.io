@@ -1,3 +1,4 @@
+
 import { MODE, OUTFLOW } from '../lib/modes.js';
 import { TAU, GOLDEN_ANGLE } from '../lib/random.js';
 import { allocate, ellipsoid } from './sculpt.js';
@@ -33,11 +34,16 @@ export const whitehole = {
       rigidity: () => 1,
     });
 
+    // Corona: 84 rays radiating from the kernel. Every 11th gets 1.8x the budget
+    // and every 5th 1.3x, so a few rays read as long and bright against the rest
+    // instead of the corona being a uniform hedgehog.
     const RAYS = 84;
     const rayBudgets = allocate(coronaShare, Array.from({ length: RAYS }, (_, index) =>
       index % 11 === 0 ? 1.8 : index % 5 === 0 ? 1.3 : 1
     ));
     for (let ray = 0; ray < RAYS; ray++) {
+      // Fibonacci sphere: walk y linearly and step the angle by the golden angle,
+      // which spreads the rays evenly without clumping at the poles.
       const y = 1 - (2 * ray + 1) / RAYS;
       const planar = Math.sqrt(Math.max(0, 1 - y * y));
       const angle = ray * GOLDEN_ANGLE + c.rng.bell() * 0.16;

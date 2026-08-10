@@ -1,14 +1,20 @@
+
 import { MODE } from '../lib/modes.js';
 import { TAU } from '../lib/random.js';
 
 const SPIN = 0.012;
 const CODE_SPIN = 0;
 
+// Tint values standing in for a syntax theme: keyword, function, plain, and the
+// value used for the mathematics. These are the 0..1 tints the shader maps onto
+// the palette, not colours.
 const KW = 0.92;
 const FN = 0.6;
 const PLAIN = 0.24;
 const MATH = 0.13;
 
+// What to spell out. `share` is this item's slice of the text budget, and the
+// runs within each line are the units that get individually tinted.
 const ITEMS = [
   {
     id: 'euler', kind: 'math', fontPx: 150, worldWidth: 12,
@@ -74,6 +80,15 @@ function fontFor(kind, px) {
     : `italic ${px}px Georgia, 'Times New Roman', serif`;
 }
 
+/* Draw one item to an offscreen canvas and return the pixels that landed.
+
+   Returns { pts, ... } where pts is a flat [x, y, runId, x, y, runId, ...] of
+   every sufficiently opaque pixel. build() then samples that list to place
+   particles.
+
+   willReadFrequently tells the browser to keep this canvas on the CPU: it is
+   written once and read back immediately, and the default GPU-backed path makes
+   getImageData a stall. */
 function raster(item) {
   if (typeof document === 'undefined') return null;
   const canvas = document.createElement('canvas');
@@ -84,6 +99,8 @@ function raster(item) {
   const lineH = Math.round(px * 1.32);
   const flat = [];
   item.lines.forEach((line) => line.forEach((run) => flat.push(run)));
+  // Spacing between the red values used to tag runs, so they stay far enough
+  // apart to survive antialiasing and be read back unambiguously.
   const step = Math.max(6, Math.floor(255 / (flat.length + 1)));
 
   ctx.font = fontFor(item.kind, px);
@@ -110,6 +127,8 @@ function raster(item) {
     line.forEach((run) => {
       const size = run.sup ? Math.round(px * 0.62) : px;
       ctx.font = fontFor(item.kind, size);
+      // Not a colour: the red channel is being used as a per-run identifier that
+      // survives into the pixel data and comes back out as a tint.
       ctx.fillStyle = `rgb(${Math.min(250, (runIndex + 1) * step)},0,0)`;
       ctx.fillText(run.t, x, y + (run.sup ? -px * 0.42 : 0));
       x += ctx.measureText(run.t).width;
@@ -117,6 +136,9 @@ function raster(item) {
     });
   });
 
+  // Keep only pixels solid enough to be part of a glyph. The threshold discards
+  // the faint antialiased fringe, which would otherwise scatter stray particles
+  // around every letter and blur the text.
   const data = ctx.getImageData(0, 0, W, H).data;
   const pts = [];
   for (let yy = 0; yy < H; yy++) {
@@ -179,8 +201,6 @@ export const codex = {
       }
     });
 
-    // Irregular chalk-dust substrate behind the type — no lattice, just a
-    // soft elliptical field with depth variance.
     for (let i = 0; i < gridShare; i++) {
       const x = c.rng.range(-29, 29);
       const y = c.rng.range(-20, 20);

@@ -1,6 +1,10 @@
+
 import { STATE_KEYS } from './chapters.js';
 import { GENERATORS } from './formations/index.js';
 
+// [key, min, max, step] for each slider, in panel order. A curated subset of
+// STATE_KEYS: the ones worth dragging, with ranges wide enough to overshoot
+// what any chapter uses so the edges of a look can be found.
 const CONTROLS = [
   ['morph', 0, 1, 0.01],
   ['size', 0.2, 3, 0.01],
@@ -59,6 +63,8 @@ const CONTROLS = [
   ['loud', 0, 1, 0.01],
 ];
 
+// What each knob actually does, in words. Shown as slider tooltips, but this
+// doubles as the reference for reading chapters.js.
 const HINTS = {
   morph: 'Blend between this chapter’s formation (0) and the next (1)',
   size: 'Global particle size multiplier',
@@ -113,6 +119,9 @@ const HINTS = {
   loud: 'How far the page text steps back this chapter',
 };
 
+// The "raw" preset: every effect off, exposure and colour neutral, clock
+// stopped. What the formation geometry looks like with nothing on top of it,
+// which is the only way to tell a badly shaped cloud from a well-lit one.
 const RAW = {
   noise: 0, bloom: 0, haze: 0, dirt: 0, trail: 0, chroma: 0, lens: 0,
   grain: 0, vignette: 0.15, dof: 0, fogTint: 0, exposure: 1, temp: 0,
@@ -222,7 +231,7 @@ export function mountDebugPanel(experience) {
   });
   btnCopy.title = 'Copy overrides as JSON — paste values into chapters.js to make them permanent';
   const btnForget = button('forget', () => {
-    try { localStorage.removeItem(STORE_KEY); } catch (_) {}
+    try { localStorage.removeItem(STORE_KEY); } catch (_) { }
     flash(btnForget, 'cleared ✓');
   });
   btnForget.title = 'Delete the saved settings (current sliders stay until reload)';
@@ -277,7 +286,7 @@ export function mountDebugPanel(experience) {
         experience.review = review;
       }
     }
-  } catch (_) {}
+  } catch (_) { }
 
   document.body.appendChild(panel);
 

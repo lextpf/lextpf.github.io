@@ -1,3 +1,4 @@
+
 import { MODE } from '../lib/modes.js';
 import { GOLDEN_ANGLE, clamp01 } from '../lib/random.js';
 
@@ -7,10 +8,14 @@ export const primordial = {
   build(c) {
     const R = 76;
     for (let i = 0; i < c.count; i++) {
+      // Power below 1 pushes the distribution outward, so the cloud does not
+      // pile up at the centre the way a uniform radius would.
       const r = 6 + R * Math.pow(c.rng.unit(), 0.55);
       const theta = i * GOLDEN_ANGLE + c.rng.signed() * 0.5;
       const cosPhi = c.rng.signed();
       const sinPhi = Math.sqrt(Math.max(0, 1 - cosPhi * cosPhi));
+      // A scattering of much larger particles. Without a few bright anchors a
+      // uniform field of small dots reads as noise rather than as depth.
       const lead = c.rng.chance(0.018);
       c.write(
         r * sinPhi * Math.cos(theta),

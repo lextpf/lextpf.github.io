@@ -1,3 +1,4 @@
+
 import { TAU, GOLDEN_ANGLE, clamp01 } from '../lib/random.js';
 
 export const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
@@ -20,6 +21,12 @@ export const cross = (a, b) => [
   a[0] * b[1] - a[1] * b[0],
 ];
 
+/* Build two axes perpendicular to a direction, so a curve has a "sideways" and
+   an "up" to spread particles across.
+
+   Any reference vector works except one parallel to the tangent, where the cross
+   product collapses to zero and the frame is undefined. Switching reference axis
+   once the tangent gets within about 28 degrees of vertical avoids that. */
 export function frame(tangent) {
   const t = normalize(tangent);
   const reference = Math.abs(t[1]) < 0.88 ? [0, 1, 0] : [1, 0, 0];
@@ -55,6 +62,9 @@ export function cubicTangent(curve, t) {
   ]);
 }
 
+// Approximate arc length by walking the curve in straight segments. Used to
+// hand longer curves proportionally more particles, so density stays even
+// instead of bunching up on the short ones.
 export function cubicLength(curve, steps = 24) {
   let length = 0;
   let previous = curve[0];
@@ -66,6 +76,9 @@ export function cubicLength(curve, steps = 24) {
   return length;
 }
 
+// Split a particle budget by weight, distributing the rounding remainder one at
+// a time so the parts always sum to exactly `total`. The same guarantee
+// ctx.split gives, but for a sub-budget inside a generator.
 export function allocate(total, weights) {
   const sum = weights.reduce((value, weight) => value + Math.max(0, weight), 0) || 1;
   const budgets = weights.map((weight) => Math.floor(total * Math.max(0, weight) / sum));
@@ -74,8 +87,19 @@ export function allocate(total, weights) {
   return budgets;
 }
 
+// Every style field may be a constant or a function of position along the shape,
+// so a tube can taper, or a blob can be tinted by depth, without two code paths.
 const resolve = (value, t) => typeof value === 'function' ? value(t) : value;
 
+/* Fill a cubic Bezier with particles, as though extruding a cylinder along it.
+
+   Walk the curve, build a frame at each point, and scatter within a disc facing
+   along the tangent. Two details keep it from looking synthetic:
+
+   sqrt on the radial distance gives uniform coverage of the disc. Without it,
+   points crowd the centre line, because a disc has more area near its rim than
+   near its middle. The (i + rng) stride jitters each point within its own slot
+   along the curve, so the result is evenly spread but not visibly regular. */
 export function tube(c, curve, count, style) {
   if (count <= 0) return;
   for (let i = 0; i < count; i++) {
@@ -103,6 +127,20 @@ export function tube(c, curve, count, style) {
   }
 }
 
+/* Fill an ellipsoid, optionally with a denser skin.
+
+   Three things make this read as a solid body rather than a cloud of dots:
+
+   Picking y uniformly and deriving the planar radius from it distributes points
+   evenly over the sphere, instead of bunching them at the poles the way stepping
+   through latitude and longitude does.
+
+   The cube root on the radius (volumePower 1/3) fills the volume evenly. A
+   uniform radius would pack points toward the centre, since volume grows with
+   the cube of the radius.
+
+   `shellShare` then pushes a fraction of them out to the surface, which is what
+   gives a blob a readable edge instead of fading out into nothing. */
 export function ellipsoid(c, centre, count, style) {
   if (count <= 0) return;
   const radii = style.radii || [1, 1, 1];

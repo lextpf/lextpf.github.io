@@ -1,22 +1,31 @@
+
 import { MODE } from '../lib/modes.js';
 import { TAU } from '../lib/random.js';
 
+// Body radius, height of the crown, total height, and how far the faces bulge.
 const R = 4.5;
 const H = 4.5;
 const T = 5.0;
 const AMP = 0.30;
+// The pose. Applied last, by orient().
 const LEAN_Z = 0.20;
 const LEAN_X = 0.30;
 
+// Precomputed once. These run inside loops tens of thousands deep, and calling
+// cos/sin per point would be pure waste for a rotation that never changes.
 const CZ = Math.cos(LEAN_Z), SZ = Math.sin(LEAN_Z);
 const CX = Math.cos(LEAN_X), SX = Math.sin(LEAN_X);
 
+// Tilt a point from the crystal's own upright axes into its final pose: a
+// rotation about z, then about x, unrolled rather than going through a matrix.
 function orient(p) {
   const x = CZ * p[0] - SZ * p[1];
   const y = SZ * p[0] + CZ * p[1];
   return [x, CX * y - SX * p[2], SX * y + CX * p[2]];
 }
 
+// Key-light direction, in the crystal's own upright space, so shading is
+// computed before the pose is applied and the two stay independent.
 const KEY = (() => {
   const v = [-0.42, 0.70, 0.58];
   const l = Math.hypot(...v);
@@ -307,8 +316,6 @@ export const crystal = {
         let edgeDistance;
         if (face.kind === 'prism') {
           const u = c.rng.unit();
-          // growth lamellae: the vertical coordinate snaps to discrete layers,
-          // so face fill reads as clean crystal striae instead of scatter.
           const v = (Math.floor(c.rng.unit() * 9) + 0.5) / 9 + c.rng.bell() * 0.008;
           p = lerp3(lerp3(face.quad[0], face.quad[1], u), lerp3(face.quad[3], face.quad[2], u), v);
           edgeDistance = Math.min(u, 1 - u, v, 1 - v) * 2;

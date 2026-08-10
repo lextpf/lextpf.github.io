@@ -1,9 +1,11 @@
+
 import { MODE, TUNNEL } from '../lib/modes.js';
 import { TAU, clamp01, smoothstep } from '../lib/random.js';
 
 const Z_MIN = TUNNEL.zMin;
 const Z_LEN = TUNNEL.length;
 
+// Layer speeds. The spread between them IS the depth cue.
 const RING_SPEED = 0.6;
 const HELIX_SPEED = 0.95;
 const STREAK_SPEED = 1.55;
@@ -12,12 +14,17 @@ const HAZE_SPEED = 0.38;
 const RING_PITCH = 7.5;
 const BASE_RADIUS = 19;
 
+// The tunnel is not a cylinder. A slow sine gives it an irregular swell along
+// its length, and `throat` pinches it to 62% around z = -110, so there is a
+// narrow point to travel through rather than an endless uniform pipe.
 function radiusAt(z) {
   const swell = 1 + 0.16 * Math.sin(z * 0.05 + 1.2);
   const throat = 0.62 + 0.38 * smoothstep(Math.abs(z + 110) / 60);
   return BASE_RADIUS * swell * throat;
 }
 
+// 0 at the far end, 1 nearest the camera. Drives size and stagger, so the morph
+// assembles the tunnel from the far end forward.
 const depthAt = (z) => clamp01(1 - (z - Z_MIN) / Z_LEN);
 
 export const wormhole = {
@@ -31,6 +38,9 @@ export const wormhole = {
 
     for (let i = 0; i < rings; i++) {
       const band = i % ringCount;
+      // Offset every fourth ring by a different amount, so the hoops fall into a
+      // four-beat pattern instead of a perfectly even comb. Evenly spaced rings
+      // strobe badly as they stream past.
       const cadence = [0, 0.55, 1.35, 2.15][band % 4];
       const z = Z_MIN + band * RING_PITCH + cadence + c.rng.bell() * 0.5;
       const r = radiusAt(z) * (1 + c.rng.bell() * 0.045);

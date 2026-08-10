@@ -1,4 +1,7 @@
 
+/* Shared by every pass below. It does no transformation at all: the geometry is
+   already a quad in clip space covering -1..1, so the position passes straight
+   through. All the work is in the fragment shaders. */
 export const fullscreenVertex = /* glsl */ `
 varying vec2 vUv;
 void main() {
@@ -7,6 +10,13 @@ void main() {
 }
 `;
 
+/* Trails. Combines this frame with the fading previous one.
+
+   max() rather than a blend, deliberately. Averaging would dim the current frame
+   toward the history and fog the whole image; taking the brighter of the two
+   leaves anything currently lit at full strength and only lets the decayed
+   history show where this frame is darker. So a moving particle draws a tail and
+   a still image stays crisp. */
 export const trailFragment = /* glsl */ `
 precision highp float;
 varying vec2 vUv;
@@ -20,6 +30,23 @@ void main() {
 }
 `;
 
+/* Bright pass. Extracts the parts of the image that should glow, and is the
+   first step of the bloom chain.
+
+   Two things are happening at once.
+
+   The nine taps with weights 4/2/1 are a 3x3 tent filter, prefiltering as it
+   extracts. Without it, single bright pixels survive into the blur chain and
+   flicker violently as they move sub-pixel distances between frames, which on a
+   screen made of 100,000 moving points would be unwatchable.
+
+   Those `1 / (1 + luminance)` weights are Karis averaging: weighting each tap by
+   the inverse of its own brightness before averaging. It stops one very bright
+   pixel from dominating its neighbourhood and is the standard fix for bloom
+   fireflies in a high dynamic range buffer, which this is.
+
+   The threshold then has a soft knee rather than a hard cut, so a particle
+   brightening past the threshold ramps into bloom instead of switching it on. */
 export const brightFragment = /* glsl */ `
 precision highp float;
 varying vec2 vUv;
@@ -57,6 +84,12 @@ void main() {
 }
 `;
 
+/* Downsample by half, for the next rung of the bloom mip chain.
+
+   A 3x3 tent again (weights 0.25 centre, 0.125 edges, 0.0625 corners, summing to
+   1), rather than letting the hardware do a plain bilinear halving. Bilinear
+   only looks at 4 texels, so at every halving it throws away information that
+   then reappears as crawling aliasing once the result is scaled back up. */
 export const downFragment = /* glsl */ `
 precision highp float;
 varying vec2 vUv;
@@ -76,6 +109,18 @@ void main() {
 }
 `;
 
+/* One axis of a Gaussian blur. post-processing.js runs it twice per mip level,
+   once horizontally and once vertically, which gives a 2D blur for 2N samples
+   instead of N squared.
+
+   Only five taps for what is effectively a nine-tap Gaussian. The offsets are
+   fractional (1.3846, 3.2308), so each sample sits between two texels and the
+   hardware's bilinear filter returns their weighted average for free. That is
+   the standard linear-sampling Gaussian trick: two texels per fetch, half the
+   samples, identical result.
+
+   uDirection carries the radius as well as the axis, since it is supplied in
+   texels by the caller. */
 export const blurFragment = /* glsl */ `
 precision highp float;
 varying vec2 vUv;
@@ -91,6 +136,55 @@ void main() {
 }
 `;
 
+/* ==========================================================================
+   THE COMPOSITE PASS
+
+   The last pass, the only one that writes to the canvas, and by far the largest.
+   Everything upstream produced an ingredient; this assembles them and grades the
+   result into the final image.
+
+   Note that the event horizon is drawn HERE, not by any particle. The black disc
+   and its photon ring are painted in 2D at the position and radius
+   CameraRig.projectSphere hands over in uCenter and uHorizon. The black hole
+   formation only ever builds what surrounds the hole.
+
+   --- What main() does, in order ---
+
+     sampleScene        reads the scene, and applies gravitational lensing and
+                        chromatic aberration on the way in. Both work by warping
+                        the lookup coordinates rather than by drawing anything, so
+                        the whole image bends around the hole instead of a bent
+                        copy being laid over it
+     trails             the accumulated history buffer, if trails are on
+     horizon and ring   the black disc, the photon ring, and its two bright arcs.
+                        The white hole takes the same code path with uHorizonLight
+                        inverting it from an absence into a source
+     haze               a radial volumetric wash, modulated by local brightness so
+                        it thickens where there is light to catch and cleared from
+                        inside the horizon
+     bloom              the three mip levels mixed back separately, tight for the
+                        crisp halo and wide for the atmospheric glow. All three
+                        are occluded by the horizon (bloomOcclude), or the hole
+                        would glow through its own event horizon
+     dirt               lens grime, lit by the widest bloom level
+     grade              exposure, temperature, saturation, contrast, lift
+     tonemap            compress high dynamic range into displayable range
+     grain and vignette both applied last, after tonemapping, so they behave like
+                        artefacts of the image rather than of the scene
+     linearToSrgb       the final conversion. The renderer is set to linear
+                        output precisely so this pass can own it
+
+   --- Helper functions ---
+
+     aspectify      correct a screen-space offset for the viewport aspect, so
+                    round things stay round on a wide window
+     hash           cheap per-pixel pseudo-random, for grain and dither
+     lensUv         the gravitational lens warp
+     sampleScene    sample the scene texture, with the per-channel offset that
+                    produces chromatic aberration
+     tonemap        the filmic curve
+     linearToSrgb   gamma encode on the way out
+   ========================================================================== */
 export const compositeFragment = /* glsl */ `
 precision highp float;
 varying vec2 vUv;

@@ -1,9 +1,16 @@
+
 import { MODE } from '../lib/modes.js';
 import { TAU } from '../lib/random.js';
 
+// How tightly the logarithmic arms wind. Larger is looser.
 const PITCH = 6.0;
 const R0 = 3.4;
+// Angular speed falling off with radius, so the disc shears as it turns rather
+// than rotating rigidly.
 const ARM_RATE = (r) => 0.34 / (1 + 0.13 * r);
+// Vertical warp of the outer disc. Zero inside r = 14, then growing with the
+// square of the distance beyond it, summed over three waves at unrelated
+// frequencies so the rim undulates without any visible period.
 const warpY = (r, a) => {
   const w = Math.pow(Math.max(0, (r - 14) / 32), 2);
   return w * 3.6 * Math.sin(a - 0.9)
@@ -11,6 +18,9 @@ const warpY = (r, a) => {
     + w * 1.4 * Math.sin(a * 4.7 - r * 0.13);
 };
 
+// Build one complete galaxy at an arbitrary origin and scale. Used once for the
+// primary and again for each companion, so they are the same object seen small
+// rather than a different, cheaper thing.
 function spiral(c, budget, origin, scale, tintBias) {
   const core = Math.floor(budget * 0.24);
   const arms = Math.floor(budget * 0.66);
@@ -139,8 +149,6 @@ export const galaxy = {
       const thickness = 2.4 * Math.exp(-r / 26) + 0.28 + t * 0.6;
       const spine = 1 - Math.min(1, Math.abs(scatter) / 0.24);
       const warmStar = c.rng.chance(0.022);
-      // arms are mostly fine grain with sparse resolved stars: a photographic
-      // star-stream instead of a chain of uniform blobs.
       const fineDust = c.rng.chance(0.72);
       c.write(
         Math.cos(a) * r,
@@ -148,7 +156,7 @@ export const galaxy = {
         Math.sin(a) * r,
         warmStar ? c.rng.range(1.15, 1.8)
           : fineDust ? (0.13 + spine * c.rng.range(0.06, 0.22)) * (1 - t * 0.25)
-          : (0.34 + spine * c.rng.range(0.24, 0.6)) * (1 - t * 0.3),
+            : (0.34 + spine * c.rng.range(0.24, 0.6)) * (1 - t * 0.3),
         warmStar ? c.rng.range(0.04, 0.2) : 0.2 + t * 0.42 + spine * 0.12 + c.rng.range(0, 0.1),
         0.25 + t * 0.6,
         ARM_RATE(r),
@@ -290,7 +298,6 @@ export const galaxy = {
 
     const rest = c.count - c.cursor;
     for (let i = 0; i < rest; i++) {
-      // starfield shell: dust with sparse crisp stars in every direction
       const star = i % 4 === 0;
       const r = 40 + 42 * Math.pow(c.rng.unit(), 0.75);
       const cosPhi = c.rng.signed();

@@ -1,6 +1,10 @@
+
 import { MODE, ORBIT_PLANETS, orbitSatelliteSpin } from '../lib/modes.js';
 import { TAU, GOLDEN_ANGLE, fibonacciDirection } from '../lib/random.js';
 
+// A fixed key-light direction. There is no lighting pass here, so shading is
+// baked into each particle's size and tint at bake time from the angle between
+// its surface normal and this vector. That is what gives the planets a lit side.
 const KEY = (() => {
   const v = [-0.55, 0.5, 0.66];
   const l = Math.hypot(...v);
@@ -29,11 +33,14 @@ const MOONS = [
   { planet: 2, d: 2.6, r: 0.2, rate: 1.8, dy: 0.15, tint: 0.3 },
 ];
 
+/* The gravity well. How far the grid sags at a given point on the floor.
+
+   Two terms, because one cannot do both jobs. `dish` is the broad, slow bowl
+   that has to stay shallow enough for the outer grid to read as a plane. `shaft`
+   is a narrow Gaussian spike at the centre, giving the well a throat that
+   plunges out of frame. A single curve steep enough for the middle would drag
+   the entire floor down with it. */
 function sheet(x, z) {
-  // Two-part relativistic well, after the classic "black hole vs star"
-  // diagram: a graceful outer dish plus a deep near-vertical shaft — walls
-  // almost parallel — plunging toward the singularity. Lake swell is animated
-  // in the vertex shader (ORBIT sheet branch), not baked here.
   const rad = Math.hypot(x, z);
   const dish = -12.5 / Math.pow(1 + (rad * rad) / (3.6 * 3.6), 0.8);
   const shaft = -21 * Math.exp(-(rad * rad) / (1.4 * 1.4));
@@ -55,10 +62,6 @@ function shell(c, budget, opts) {
   const rocky = opts.rocky || 0;
   const dir = [0, 0, 0];
   const jitter = 1.6 / Math.sqrt(Math.max(16, budget));
-  // Shuffle the fibonacci order: written sequentially it sweeps pole-to-pole,
-  // and since morph flights map buffer-contiguous particles to contiguous
-  // source regions, the planet assembled as latitude slabs sliding together.
-  // Shuffled, arrivals build the whole sphere uniformly.
   const order = new Array(budget);
   for (let i = 0; i < budget; i++) order[i] = i;
   for (let i = budget - 1; i > 0; i--) {
@@ -122,8 +125,6 @@ export const planetary = {
     lines.forEach((line, index) => {
       const span = line.axis === 0 ? EXTENT_Z : EXTENT_X;
       const major = index % 3 === 0;
-      // Concentrate samples where the line dives into the well: uniform
-      // spacing undersamples the steep throat and reads as jagged steps.
       const pull = 1 / (1 + (line.at * line.at) / 58);
       const K = 7.5;
       const half = Math.atan(span / K);
@@ -136,6 +137,9 @@ export const planetary = {
         const z = line.axis === 0 ? u : line.at;
         const y = sheet(x, z);
         const rad = Math.hypot(x, z);
+        // Brighten the grid wherever it passes under a planet's orbit. A
+        // Gaussian centred on each orbital radius, so the emphasis falls off
+        // smoothly rather than drawing four hard rings.
         let band = 0;
         for (let w = 0; w < WORLDS.length; w++) {
           const g = (rad - ORBIT_PLANETS[w].R) / (ORBIT_PLANETS[w].width * 0.9);
@@ -159,7 +163,6 @@ export const planetary = {
     });
 
     const coreCentre = [0, sheet(0, 0) - 0.15, 0];
-    // A bare ring singularity: one crisp luminous annulus, nothing inside it.
     const RING_R = 0.42;
     const anchorN = 14;
     for (let i = 0; i < coreShare; i++) {
@@ -185,8 +188,6 @@ export const planetary = {
       const a = (f / FUNNELS) * TAU + 0.21;
       for (let i = 0; i < perFunnel; i++) {
         const t = (i + 0.5) / perFunnel;
-        // threads live only in the shaft — the sheet's own grid shows the
-        // upper warp; the funnel drape starts where the plunge begins
         const r = 0.35 + (2.6 - 0.35) * Math.pow(1 - t, 1.2);
         const y = sheet(r, 0);
         const dip = Math.min(1, -y / 9);
@@ -357,9 +358,6 @@ export const planetary = {
     }
 
     for (let i = 0; i < fieldShare; i++) {
-      // starfield: every particle in the shell is spent where the camera can
-      // see it — 72% of the sky sits above the sheet, only a thin scatter
-      // below for scroll parallax.
       const star = i % 3 === 0;
       const r = 34 + 46 * Math.pow(c.rng.unit(), 0.7);
       const upper = c.rng.unit() < 0.72;

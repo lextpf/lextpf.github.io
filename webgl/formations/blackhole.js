@@ -1,9 +1,14 @@
+
 import { MODE, ACCRETION } from '../lib/modes.js';
 import { TAU } from '../lib/random.js';
 import { BIPOLAR_PLUME_SPIN, writeBipolarPlumes } from './bipolar-plumes.js';
 
+// Exported because cv-universe.js needs it to project the horizon to screen
+// space for the composite pass. Changing it moves the drawn disc too.
 export const BLACK_HOLE_HORIZON = 6.2;
 
+// The disc is deliberately not face-on. Seen edge-on it is a line, face-on it is
+// a target; tilted, the jets and the disc are both legible at once.
 export const BLACK_HOLE_TILT = { x: -1.08, y: 0.58, z: 0 };
 const R = BLACK_HOLE_HORIZON;
 
@@ -11,7 +16,13 @@ const INNER_IN = R * 1.06;
 const INNER_OUT = R * 2.45;
 const OUTER_OUT = R * 2.8;
 
+// Angular velocity falling off as r^-1.5: Kepler's third law. Inner material
+// laps outer material, which is what shears the lanes into spirals over time
+// instead of rotating the disc as a rigid plate.
 const OMEGA = (r) => 4.8 / Math.pow(Math.max(R, r), 1.5);
+// Relativistic beaming, faked. Material rotating toward the viewer appears
+// brighter than material rotating away, so brightness is modulated around the
+// disc by a cosine offset to put the bright side where the composition wants it.
 const DOPPLER = 0.55;
 const doppler = (a) => Math.cos(a - DOPPLER);
 
@@ -26,14 +37,16 @@ export const blackhole = {
       coreShare, sheathShare, haloShare] =
       c.split([0.20, 0.18, 0.18, 0.06, 0.20, 0.16, 0.02]);
 
+    // Inner disc: 26 discrete lanes rather than a smooth gradient, so the disc
+    // has visible banding. Radii are spaced geometrically, which keeps the lanes
+    // evenly spaced to the eye across a radius that more than doubles.
     for (let i = 0; i < innerShare; i++) {
-      // material lives in fine log-spaced lanes: with Kepler shear and the
-      // motion streaks each lane reads as a continuous flowing thread, not a
-      // scatter of dots. A sparse ember population keeps the sparkle.
       const lane = Math.floor(Math.pow(c.rng.unit(), 1.15) * 26);
       const u = (lane + 0.5) / 26 + c.rng.bell() * 0.012;
       const r = INNER_IN * Math.pow(INNER_OUT / INNER_IN, Math.min(1, Math.max(0, u)));
       const a = c.rng.unit() * TAU;
+      // Brightness varying with both angle and log radius: a four-armed spiral
+      // wound through the disc, baked in as the pattern shear would produce.
       const shear = 0.5 + 0.5 * Math.cos(4 * a - Math.log(r / INNER_IN) * 17);
       const d = doppler(a);
       const ember = c.rng.chance(0.03);
@@ -42,7 +55,7 @@ export const blackhole = {
         Math.sin(a) * r,
         c.rng.bell() * r * 0.03,
         (ember ? c.rng.range(0.72, 1.0) : c.rng.range(0.24, 0.5))
-          * (0.72 + shear * 0.5) * (1 + d * 0.22),
+        * (0.72 + shear * 0.5) * (1 + d * 0.22),
         Math.min(1, 0.4 + shear * 0.24 + Math.max(0, d) * 0.22),
         0.1 + u * 0.14,
         OMEGA(r),
@@ -50,6 +63,9 @@ export const blackhole = {
       );
     }
 
+    // Nine short arcs sweeping ahead of the inner disc, brightest at the leading
+    // tip. Frozen streaks of material being dragged around the hole, which give
+    // the disc a direction of rotation even in a still frame.
     const DRAG = 9;
     const perDrag = Math.max(10, Math.floor(dragShare / DRAG));
     for (let s = 0; s < DRAG; s++) {
@@ -94,6 +110,9 @@ export const blackhole = {
       );
     }
 
+    // Infall halo: spherical, not disc-shaped, and stepping outward in order of
+    // stagger so a morph fills it from the inside out. Negative spin marks these
+    // as counter-rotating, which the shader reads as falling inward.
     for (let i = 0; i < infallShare; i++) {
       const t = (i + c.rng.unit()) / infallShare;
       const radius = ACCRETION.infallIn + ACCRETION.infallSpan * t;
@@ -117,6 +136,9 @@ export const blackhole = {
       spin: BIPOLAR_PLUME_SPIN,
     });
 
+    // Whatever is left over, spread thin and far out. Claiming the remainder
+    // here rather than leaving it to the registry's invisible filler means even
+    // the background dust belongs to this scene and rotates with it.
     const rest = c.count - c.cursor;
     for (let i = 0; i < rest; i++) {
       const r = OUTER_OUT * 1.9 + 44 * Math.pow(c.rng.unit(), 0.72);
@@ -132,6 +154,9 @@ export const blackhole = {
         0
       );
     }
+    // Destructured out of the split above but folded into `rest` instead of
+    // being placed separately. Referenced so the unused binding is deliberate
+    // rather than an oversight, and so the split's shares still sum to 1.
     void haloShare;
   },
 };

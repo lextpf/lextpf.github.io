@@ -1,4 +1,4 @@
-import { ORBIT_PLANETS, NUCLEUS_SHELLS } from '../lib/modes.js';
+import { ORBIT_PLANETS, NUCLEUS_SHELLS, REACT_PLANES, REACT_BODY_SPIN, ACCRETION, OUTFLOW } from '../lib/modes.js';
 
 const glslFloat = (n) => {
   const s = String(n);
@@ -24,6 +24,21 @@ const NUCLEUS_AXES = NUCLEUS_SHELLS.map((sh, i) => {
   return `${i ? 'else ' : ''}if (k < ${i}.5) { ax = vec3(${glslFloat(x)}, ${glslFloat(y)}, ${glslFloat(z)}); }`;
 }).join('\n      ');
 
+const REACT_TABLE = REACT_PLANES.map((pl, i) => {
+  const [cx, cy, cz] = pl.centre;
+  const n = Math.hypot(...pl.axis);
+  const [x, y, z] = pl.axis.map((v) => +(v / n).toFixed(5));
+  return `${i ? 'else ' : ''}if (k < ${i}.5) { C = vec3(${glslFloat(cx)}, ${glslFloat(cy)}, ${glslFloat(cz)}); ax = vec3(${glslFloat(x)}, ${glslFloat(y)}, ${glslFloat(z)}); }`;
+}).join('\n      ');
+const REACT_W = glslFloat(REACT_BODY_SPIN);
+
+const FALL_CONSTS = `const float FALL_IN = ${glslFloat(ACCRETION.infallIn)};
+  const float FALL_SPAN = ${glslFloat(ACCRETION.infallSpan)};
+  const float FALL_SPEED = ${glslFloat(ACCRETION.infallSpeed)};`;
+const EJECT_CONSTS = `const float EJECT_START = ${glslFloat(OUTFLOW.ejectStart)};
+  const float EJECT_SPAN = ${glslFloat(OUTFLOW.ejectSpan)};
+  const float EJECT_SPEED = ${glslFloat(OUTFLOW.ejectSpeed)};`;
+
 const ORBIT_SHADOW = ORBIT_PLANETS.map((p, i) => {
   const cx = glslFloat(+(p.R * Math.cos(p.phase)).toFixed(5));
   const cz = glslFloat(+(p.R * Math.sin(p.phase)).toFixed(5));
@@ -43,6 +58,77 @@ const ORBIT_WAKE = ORBIT_PLANETS.map((p) => {
       wake += prox * dot(normalize(dd + vec2(1e-4, 0.0)), -normalize(vec2(pp.y, -pp.x))); }`;
 }).join('\n    ');
 
+/* ==========================================================================
+   THE VERTEX SHADER
+
+   The hot path of the entire project. This runs once per particle per frame, up
+   to 100,000 times at 60fps, and it is where every particle position actually
+   comes from. The CPU never moves a particle; it only supplies two static
+   formations and a morph value, and this decides where the particle is.
+
+   By convention nothing inside the GLSL below is commented, so the map is here.
+
+   --- What main() does, in order ---
+
+    1. Stagger. Each particle derives its own morph progress from its seed, so a
+       transition is a wave across the cloud rather than everything moving at
+       once. uStaggerSpan is how wide that wave is.
+    2. Early out. Particles that are invisible at both ends (the registry's
+       filler) are pushed off-screen at zero size and cost nothing further.
+    3. shape() on both endpoints, animating each formation by its own MODE and
+       its own clock. This is where a formation's motion lives.
+    4. The flight path between them: a bowed arc rather than a straight line
+       (uArc), with per-particle lane and polar variation so paths fan out. The
+       vortex and pinch set-pieces override this to route particles out through
+       the tunnel or in through the singularity.
+    5. Curl-like noise displacement, weighted by 1 - role: loose dust wanders,
+       rigid structure barely moves.
+    6. Pointer displacement, via touchDisp, in whichever of the TOUCH modes the
+       two bound formations asked for.
+    7. Projection, then point size: circle-of-confusion for depth of field,
+       perspective attenuation, hard clamps, and a sub-pixel fade so particles
+       too small to draw dim out instead of shimmering.
+    8. Motion streaks. Velocity is obtained by finite difference, calling shape()
+       again at clock + H and subtracting, then projected to screen space to
+       give the fragment shader a direction and a stretch factor.
+    9. Colour, fog, bokeh and the rest, written out as varyings.
+
+   --- Helper functions, in the order they appear ---
+
+     dopplerFor          relativistic beaming: brightens the side of a rotating
+                         disc that is turning toward the camera
+     jetBase             how far along a polar jet a particle is
+     sheetWake           the ripple a planet leaves in the spacetime grid
+     satelliteShadow     eclipse darkening where a body passes over the grid
+     perihelionSpark     brightening at closest approach
+     holeDim             darkening as a particle nears the event horizon
+     curvedTransport     the bowed path a particle takes between formations
+     plumeMotion         motion of particles inside the bipolar jets
+     shape               the big one: per-MODE animation, dispatching on the
+                         MODE enum from lib/modes.js. Everything a formation
+                         does after it is baked happens here
+     transportVisibility hides particles during the part of an infall or ejection
+                         cycle where they should not be visible, so recycling
+                         does not show as popping
+     flow                the noise field: two octaves of a divergence-free sine
+                         pattern, which swirls rather than dilating and so moves
+                         dust without thinning or bunching it
+     touchDisp           pointer displacement, dispatching on the TOUCH enum
+
+   --- Things worth knowing before editing ---
+
+   Constants baked in from JS. The ${...} interpolations near the top of the
+   string splice in generated GLSL built from the tables in lib/modes.js, so the
+   orbits, shells and reaction planes are identical on both sides. Editing those
+   numbers here rather than there breaks the correspondence silently.
+
+   `spin` is overloaded. Below 90 it is a literal rate; 100+, 200+ and 500+ are
+   tags identifying which body a particle belongs to. See lib/modes.js.
+
+   shape() is called four times per vertex: twice for the endpoints and twice
+   more for the finite-difference velocity. It is the most expensive thing here
+   and the first place to look if frame times regress.
+   ========================================================================== */
 export const particleVertex = /* glsl */ `
 attribute vec3 aPosB;
 attribute vec4 aAttrA;
@@ -58,7 +144,7 @@ uniform float uTime;
 uniform float uClockA;
 uniform float uClockB;
 uniform float uSize;
-uniform float uPixelRatio;
+uniform float uSizeScale;
 uniform float uNoise;
 uniform float uNoiseScale;
 uniform float uNoiseSpeed;
@@ -205,10 +291,8 @@ vec3 shape(vec3 p, float spin, int mode, mat3 tilt, float clock, vec3 pivot) {
     return p;
   }
   if (mode == 5) {
-    const float JET_THRESHOLD = 4.0;
-    const float FALL_IN = 6.6;
-    const float FALL_SPAN = 32.0;
-    const float FALL_SPEED = 4.4;
+    const float JET_THRESHOLD = ${glslFloat(ACCRETION.jetThreshold)};
+    ${FALL_CONSTS}
     if (spin < 0.0) {
       float baseRadius = length(p);
       float distance = mod(baseRadius - FALL_IN - clock * FALL_SPEED, FALL_SPAN) + FALL_IN;
@@ -233,9 +317,7 @@ vec3 shape(vec3 p, float spin, int mode, mat3 tilt, float clock, vec3 pivot) {
   if (mode == 7) {
     vec3 q = p - pivot;
     if (spin < 0.0) {
-      const float EJECT_START = 1.2;
-      const float EJECT_SPAN = 49.0;
-      const float EJECT_SPEED = 7.2;
+      ${EJECT_CONSTS}
       float radius = length(q);
       float distance = mod(radius - EJECT_START + clock * EJECT_SPEED, EJECT_SPAN) + EJECT_START;
       float progress = (distance - EJECT_START) / EJECT_SPAN;
@@ -297,7 +379,26 @@ vec3 shape(vec3 p, float spin, int mode, mat3 tilt, float clock, vec3 pivot) {
   float s = sin(a);
   float c = cos(a);
   if (mode == 1) {
-    if (spin >= 200.0) {
+    if (spin >= 500.0 && spin < 700.0) {
+      float enc = spin - 500.0;
+      float k = floor(enc * 0.1);
+      float w = enc - k * 10.0 - 5.0;
+      vec3 C = vec3(0.0);
+      vec3 ax = vec3(0.0, 1.0, 0.0);
+      ${REACT_TABLE}
+      vec3 d = q - C;
+      float aa = w * clock;
+      float ss = sin(aa);
+      float cc = cos(aa);
+      d = d * cc + cross(ax, d) * ss + ax * dot(ax, d) * (1.0 - cc);
+      q = C + d;
+      float ba = ${REACT_W} * clock;
+      float bs = sin(ba);
+      float bc = cos(ba);
+      q = vec3(bc * q.x + bs * q.z, q.y, -bs * q.x + bc * q.z);
+      return tilt * (q + pivot);
+    }
+    if (spin >= 200.0 && spin < 300.0) {
       float enc = spin - 200.0;
       float k = floor(enc * 0.1);
       float w = enc - k * 10.0 - 5.0;
@@ -320,18 +421,14 @@ vec3 shape(vec3 p, float spin, int mode, mat3 tilt, float clock, vec3 pivot) {
 
 float transportVisibility(vec3 p, float spin, int mode, float clock) {
   if (mode == 7 && spin < 0.0) {
-    const float EJECT_START = 1.2;
-    const float EJECT_SPAN = 49.0;
-    const float EJECT_SPEED = 7.2;
+    ${EJECT_CONSTS}
     float distance = mod(length(p) - EJECT_START + clock * EJECT_SPEED, EJECT_SPAN) + EJECT_START;
     float emerge = smoothstep(EJECT_START + 0.45, EJECT_START + 2.3, distance);
     float leave = 1.0 - smoothstep(EJECT_START + EJECT_SPAN - 7.0, EJECT_START + EJECT_SPAN, distance);
     return emerge * leave;
   }
   if (mode != 5) return 1.0;
-  const float FALL_IN = 6.6;
-  const float FALL_SPAN = 32.0;
-  const float FALL_SPEED = 4.4;
+  ${FALL_CONSTS}
   if (spin < 0.0) {
     float radius = mod(length(p) - FALL_IN - clock * FALL_SPEED, FALL_SPAN) + FALL_IN;
     float horizon = smoothstep(FALL_IN, FALL_IN + 1.3, radius);
@@ -384,11 +481,14 @@ vec3 touchDisp(vec3 p, vec3 t, float dust, float seed, vec3 pivot, float spin, m
     return dir * wave * g * (0.12 + 0.34 * dust) * calm;
   }
   if (m < 6.5) {
+    float bound = 1.0 - smoothstep(0.72, 0.95, dust);
+    glow *= bound;
+    if (bound < 1e-4) return vec3(0.0);
     vec3 jig = vec3(
       sin(uTime * 21.0 + seed * 61.7),
       cos(uTime * 24.0 + seed * 47.3),
       sin(uTime * 18.5 + seed * 83.1));
-    return (jig * 0.8 + dir * 0.12) * g * give;
+    return (jig * 0.8 + dir * 0.12) * g * give * bound;
   }
   if (m < 7.5) {
     float wave = sin(uTime * 5.2 - p.z * 0.5 + seed * 4.0);
@@ -419,9 +519,7 @@ vec3 touchDisp(vec3 p, vec3 t, float dust, float seed, vec3 pivot, float spin, m
 }
 
 void main() {
-  float stagger = mix(aAttrA.z, aAttrB.z, 0.5);
-  float anchor = smoothstep(0.45, 1.15, mix(aAttrA.x, aAttrB.x, 0.5));
-  stagger *= 1.0 - 0.55 * anchor;
+  float stagger = fract(aSeed * 317.71);
   float m = clamp((uMorph - stagger * uStaggerSpan) / max(1e-3, 1.0 - uStaggerSpan), 0.0, 1.0);
   float e = m * m * (3.0 - 2.0 * m);
   float size = mix(aAttrA.x, aAttrB.x, e);
@@ -500,9 +598,9 @@ void main() {
   coc = coc * coc * (3.0 - 2.0 * coc);
   float grow = 1.0 + coc * uDof * 2.4 * (0.55 + 0.45 * role);
   float attenuation = mix(205.0, 245.0, 1.0 - dust);
-  float px = size * uSize * uPixelRatio * grow * (attenuation / max(dist, 0.75));
-  px = min(px, mix(52.0, 8.0, dust) * uPixelRatio);
-  float floorPx = 1.05 * uPixelRatio;
+  float px = size * uSize * uSizeScale * grow * (attenuation / max(dist, 0.75));
+  px = min(px, mix(52.0, 8.0, dust) * uSizeScale);
+  float floorPx = 1.05 * uSizeScale;
   float subpixel = clamp(px / floorPx, 0.0, 1.0);
 
   float stretch = 1.0;
@@ -524,9 +622,9 @@ void main() {
       dir = normalize(vec2(track.x, -track.y));
     }
   }
-  float total = min(px * stretch, 52.0 * uPixelRatio);
+  float total = min(px * stretch, 52.0 * uSizeScale);
   stretch = max(total / max(px, 1e-3), 1.0);
-  gl_PointSize = clamp(total, floorPx, 52.0 * uPixelRatio);
+  gl_PointSize = clamp(total, floorPx, 52.0 * uSizeScale);
   vStretch = stretch;
   vDir = dir;
 
@@ -582,6 +680,42 @@ void main() {
 }
 `;
 
+/* ==========================================================================
+   THE PARTICLE FRAGMENT SHADER
+
+   Runs per pixel of every particle, and its whole job is deciding what a single
+   particle looks like up close. Each one is drawn as a square (gl_PointCoord
+   runs 0..1 across it) and this shades and shapes that square into something
+   that does not look like a square.
+
+   --- What main() does, in order ---
+
+     1. Rotate the point's local coordinates into the streak direction the vertex
+        shader worked out, and stretch along it. That is what turns a round
+        particle into a motion-aligned streak.
+     2. Discard anything outside the unit circle. Cheapest possible early out,
+        and it is what makes points round rather than square.
+     3. Build the profile: a tight Gaussian core plus a wide soft halo. `vRole`
+        picks between two shapes, so structural particles read as crisp points
+        and loose dust reads as soft glow.
+     4. The bokeh alternative. Out-of-focus particles are drawn as hexagonal
+        discs rather than blurred points, which is what a real iris does. The
+        hexagon comes from that cos(mod(theta)) expression: a cheap way to get a
+        polygon's radius as a function of angle. `iris` cross-fades between the
+        two, driven by circle-of-confusion.
+     5. Colour. Base to accent by tint, then a special branch: a tint above 1.5
+        escapes the two-colour palette into a mint/gold/rust ramp, which is how a
+        few formations get colours the palette does not contain. Then warm mix,
+        then fog by depth.
+     6. A tiny per-particle red/blue shift from the seed, so a mass of particles
+        has faint colour variation instead of being one flat hue.
+
+   Note there is no lighting here, and no lighting pass anywhere. Everything that
+   reads as shading was baked into size and tint when the formation was built.
+
+   The output is additive (see the material in particle-system.js), so this
+   returns colour premultiplied by luminance and lets overlapping particles sum.
+   ========================================================================== */
 export const particleFragment = /* glsl */ `
 precision highp float;
 
@@ -612,7 +746,6 @@ void main() {
   pcl.y *= vStretch;
   float r = length(pcl) * 2.0;
   if (r > 1.0) discard;
-
   float structure = smoothstep(0.35, 0.9, vRole);
   float core = exp(-r * r * mix(5.1, 6.5, structure));
   float halo = exp(-r * r * 1.55) * mix(0.38, 0.15, structure);
