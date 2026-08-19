@@ -22,6 +22,19 @@ const DENSITY_REFERENCE = 100000;
 // 4K panel does not render the universe as a dusting of single pixels.
 const SIZE_REFERENCE_HEIGHT = 1080;
 
+/* A legibility trim on top of the authored sizes, so formations read as geometry
+   rather than as haze. Applied post-blend beside the density compensation, which
+   makes it the one place that reaches every chapter of both scores, every tier and
+   every in-between morph frame at once.
+
+   8% is bounded on two sides. Above, densitySize already reaches 1.40 on the
+   minimal tier against its own 1.6 blur cap, so anything past ~1.14 pushes the
+   weakest tier through a ceiling its author set deliberately. Below, sprites are
+   additive with no area normalisation, so a k times size is a k squared light lift
+   - measured on frozen frames, 1.08 buys 4-7% more pixels carrying structure for
+   1-3% more mean brightness, with clipping flat to four decimals. */
+const SIZE_TRIM = 1.08;
+
 const QUALITY_LOG_MS = 2000;
 
 class WebGLExperience {
@@ -321,7 +334,9 @@ class WebGLExperience {
     const dt = clamp(dtMs / 1000, 0.001, 0.05);
     this.elapsed += dt;
     if (this.settle > 0) this.settle--;
-    else this.perf.sample(dtMs, now);
+    // vsync goes with it: the ladder judges against the cadence the cap can
+    // actually produce on this panel, which only the refresh period reveals.
+    else this.perf.sample(dtMs, now, this.vsync);
 
     // The quality heartbeat. Distinct from the "quality ->" line applyTier logs
     // on a rung change: this one keeps reporting once the ladder has converged
@@ -345,7 +360,7 @@ class WebGLExperience {
     const state = this.state;
     for (const key in live) state[key] = live[key];
     this.reframe(state);
-    state.size *= this.densitySize;
+    state.size *= this.densitySize * SIZE_TRIM;
     // Debug-panel escape hatches, both no-ops in production: `overrides` pins
     // individual knobs to slider values, `review` pins a single formation so it
     // can be inspected without scrolling to its chapter.

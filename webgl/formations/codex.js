@@ -5,23 +5,15 @@ import { TAU } from '../lib/random.js';
 const SPIN = 0.012;
 const CODE_SPIN = 0;
 
-// Tint values standing in for a syntax theme: keyword, function, plain, and the
-// value used for the mathematics. These are the 0..1 tints the shader maps onto
-// the palette, not colours.
+// Tint values standing in for a syntax theme: keyword, function, plain. These
+// are the 0..1 tints the shader maps onto the palette, not colours.
 const KW = 0.92;
 const FN = 0.6;
 const PLAIN = 0.24;
-const MATH = 0.13;
 
 // What to spell out. `share` is this item's slice of the text budget, and the
 // runs within each line are the units that get individually tinted.
 const ITEMS = [
-  {
-    id: 'euler', kind: 'math', fontPx: 150, worldWidth: 12,
-    pos: [15, 12, 0.4], share: 0.045, size: [0.22, 0.36], glintEvery: 26,
-    stagger: [0.36, 0.06],
-    lines: [[{ t: 'e', tint: MATH }, { t: 'iπ', tint: MATH, sup: true }, { t: ' + 1 = 0', tint: MATH }]],
-  },
   {
     id: 'code', kind: 'code', fontPx: 52, worldWidth: 24,
     pos: [14, -8, 0], share: 0.26, size: [0.24, 0.37], glintEvery: 60,
@@ -34,24 +26,6 @@ const ITEMS = [
       [{ t: '  return', tint: KW }, { t: ' 0;', tint: PLAIN }],
       [{ t: '}', tint: PLAIN }],
     ],
-  },
-  {
-    id: 'boltzmann', kind: 'math', fontPx: 96, worldWidth: 7,
-    pos: [22, 5, -0.6], share: 0.03, size: [0.2, 0.32], glintEvery: 40,
-    stagger: [0.44, 0.05],
-    lines: [[{ t: 'S = k ln W', tint: MATH }]],
-  },
-  {
-    id: 'secondlaw', kind: 'math', fontPx: 90, worldWidth: 8.2,
-    pos: [-22, -9.5, 0.8], share: 0.038, size: [0.2, 0.32], glintEvery: 40,
-    stagger: [0.5, 0.05],
-    lines: [[{ t: 'dS/dt ≥ 0', tint: MATH }]],
-  },
-  {
-    id: 'evolution', kind: 'math', fontPx: 100, worldWidth: 9.2,
-    pos: [-11.5, -14.5, -0.4], share: 0.036, size: [0.2, 0.32], glintEvery: 40,
-    stagger: [0.56, 0.05],
-    lines: [[{ t: 'du = f(u, t) dt', tint: MATH }]],
   },
   {
     id: 'concepts', kind: 'code', fontPx: 42, worldWidth: 26.5,

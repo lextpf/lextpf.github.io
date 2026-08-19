@@ -1,23 +1,36 @@
-import { ORBIT_PLANETS, NUCLEUS_SHELLS, REACT_PLANES, REACT_BODY_SPIN, ACCRETION, OUTFLOW } from '../lib/modes.js';
+import { GIANT, GIANT_STORMS, GIANT_FLARES, zonalRate, NUCLEUS_SHELLS, REACT_PLANES, REACT_BODY_SPIN, ACCRETION, OUTFLOW } from '../lib/modes.js';
 
 const glslFloat = (n) => {
   const s = String(n);
   return s.includes('.') || s.includes('e') ? s : `${s}.0`;
 };
-const ORBIT_TABLE = ORBIT_PLANETS.map((p, i) => {
-  const cx = glslFloat(+(p.R * Math.cos(p.phase)).toFixed(5));
-  const cz = glslFloat(+(p.R * Math.sin(p.phase)).toFixed(5));
-  return `${i ? 'else ' : ''}if (k < ${i}.5) { C = vec2(${cx}, ${cz}); W = ${glslFloat(p.rate)}; }`;
-}).join('\n    ');
+const g5 = (n) => glslFloat(+Number(n).toFixed(5));
 
-const ORBIT_DENTS = ORBIT_PLANETS.map((p) => {
-  const cx = glslFloat(+(p.R * Math.cos(p.phase)).toFixed(5));
-  const cz = glslFloat(+(p.R * Math.sin(p.phase)).toFixed(5));
-  const g2 = glslFloat(+(p.width * p.width).toFixed(5));
-  return `{ float ca = cos(${glslFloat(p.rate)} * clock); float sa = sin(${glslFloat(p.rate)} * clock);
-      vec2 dd = p.xz - vec2(ca * ${cx} + sa * ${cz}, -sa * ${cx} + ca * ${cz});
-      dy -= ${glslFloat(p.depth)} / (1.0 + dot(dd, dd) / ${g2}); }`;
-}).join('\n    ');
+const GIANT_CONSTS = `const float GIANT_R = ${g5(GIANT.radius)};
+  const float GIANT_FLARE_RATE = ${g5(GIANT.flareRate)};`;
+
+// Which vortex a storm particle belongs to: its swirl axis (the radius through
+// the storm's centre) and the zonal rate that carries the whole storm around
+// the body. Both derived from the same entry in lib/modes.js the generator
+// placed the particle from.
+const STORM_TABLE = GIANT_STORMS.map((s, i) => {
+  const cl = Math.cos(s.lat);
+  const x = g5(cl * Math.cos(s.lon));
+  const y = g5(Math.sin(s.lat));
+  const z = g5(cl * Math.sin(s.lon));
+  return `${i ? 'else ' : ''}if (k < ${i}.5) { ax = vec3(${x}, ${y}, ${z}); W = ${g5(zonalRate(Math.sin(s.lat)))}; }`;
+}).join('\n      ');
+
+// Which eruption site a flare particle belongs to: the zonal rate of the band
+// it is launched from, its offset in the shared flare cycle, and how far it
+// throws.
+const FLARE_TABLE = GIANT_FLARES.map((s, i) => (
+  `${i ? 'else ' : ''}if (k < ${i}.5) { W = ${g5(zonalRate(Math.sin(s.lat)))}; PH = ${g5(s.phase)}; RE = ${g5(s.reach)}; }`
+)).join('\n      ');
+
+const FLARE_PHASE = GIANT_FLARES.map((s, i) => (
+    `${i ? 'else ' : ''}if (k < ${i}.5) { PH = ${g5(s.phase)}; }`
+)).join('\n    ');
 
 const NUCLEUS_AXES = NUCLEUS_SHELLS.map((sh, i) => {
   const [x, y, z] = sh.axis;
@@ -38,25 +51,6 @@ const FALL_CONSTS = `const float FALL_IN = ${glslFloat(ACCRETION.infallIn)};
 const EJECT_CONSTS = `const float EJECT_START = ${glslFloat(OUTFLOW.ejectStart)};
   const float EJECT_SPAN = ${glslFloat(OUTFLOW.ejectSpan)};
   const float EJECT_SPEED = ${glslFloat(OUTFLOW.ejectSpeed)};`;
-
-const ORBIT_SHADOW = ORBIT_PLANETS.map((p, i) => {
-  const cx = glslFloat(+(p.R * Math.cos(p.phase)).toFixed(5));
-  const cz = glslFloat(+(p.R * Math.sin(p.phase)).toFixed(5));
-  const ti = glslFloat(+Math.cos(Math.atan((p.body * 0.8) / p.R)).toFixed(5));
-  const to = glslFloat(+Math.cos(Math.atan((p.body * 1.6) / p.R)).toFixed(5));
-  return `${i ? 'else ' : ''}if (k < ${i}.5) { C = vec2(${cx}, ${cz}); W = ${glslFloat(p.rate)}; TI = ${ti}; TO = ${to}; }`;
-}).join('\n    ');
-
-const ORBIT_WAKE = ORBIT_PLANETS.map((p) => {
-  const cx = glslFloat(+(p.R * Math.cos(p.phase)).toFixed(5));
-  const cz = glslFloat(+(p.R * Math.sin(p.phase)).toFixed(5));
-  const g2 = glslFloat(+(p.width * p.width * 1.69).toFixed(5));
-  return `{ float ca = cos(${glslFloat(p.rate)} * clock); float sa = sin(${glslFloat(p.rate)} * clock);
-      vec2 pp = vec2(ca * ${cx} + sa * ${cz}, -sa * ${cx} + ca * ${cz});
-      vec2 dd = p.xz - pp;
-      float prox = exp(-dot(dd, dd) / ${g2});
-      wake += prox * dot(normalize(dd + vec2(1e-4, 0.0)), -normalize(vec2(pp.y, -pp.x))); }`;
-}).join('\n    ');
 
 /* ==========================================================================
    THE VERTEX SHADER
@@ -98,8 +92,6 @@ const ORBIT_WAKE = ORBIT_PLANETS.map((p) => {
      dopplerFor          relativistic beaming: brightens the side of a rotating
                          disc that is turning toward the camera
      jetBase             how far along a polar jet a particle is
-     sheetWake           the ripple a planet leaves in the spacetime grid
-     satelliteShadow     eclipse darkening where a body passes over the grid
      perihelionSpark     brightening at closest approach
      holeDim             darkening as a particle nears the event horizon
      curvedTransport     the bowed path a particle takes between formations
@@ -209,38 +201,6 @@ float jetBase(vec3 lp, vec3 pivot, float spin, int mode) {
   return 0.0;
 }
 
-float sheetWake(vec3 p, float clock) {
-  float wake = 0.0;
-    ${ORBIT_WAKE}
-  return wake;
-}
-
-float satelliteShadow(vec3 p0, float spin, float clock) {
-  if (spin < 100.0) return 0.0;
-  float enc = spin - 100.0;
-  float k = floor(enc * 0.1);
-  float w2 = enc - k * 10.0;
-  vec2 C = vec2(0.0);
-  float W = 0.0;
-  float TI = 1.0;
-  float TO = 1.0;
-    ${ORBIT_SHADOW}
-  float a2 = w2 * clock;
-  float s2 = sin(a2);
-  float c2 = cos(a2);
-  vec2 d = vec2(p0.x - C.x, p0.z - C.y);
-  vec2 e2 = vec2(c2 * d.x + s2 * d.y, -s2 * d.x + c2 * d.y);
-  vec2 q2 = C + e2;
-  float a1 = W * clock;
-  float s1 = sin(a1);
-  float c1 = cos(a1);
-  vec2 sp = vec2(c1 * q2.x + s1 * q2.y, -s1 * q2.x + c1 * q2.y);
-  vec2 Cp = vec2(c1 * C.x + s1 * C.y, -s1 * C.x + c1 * C.y);
-  float behind = step(length(Cp) + 0.2, length(sp));
-  float cosA = dot(normalize(Cp), normalize(sp));
-  return behind * smoothstep(TO, TI, cosA);
-}
-
 float perihelionSpark(vec3 sp, float spin, int mode, vec3 pivot) {
   if (mode != 1 || spin < 200.0) return 0.0;
   float pvz = (modelViewMatrix * vec4(pivot, 1.0)).z;
@@ -331,39 +291,46 @@ vec3 shape(vec3 p, float spin, int mode, mat3 tilt, float clock, vec3 pivot) {
     return tilt * (q + pivot);
   }
   if (mode == 8) {
-    if (spin < -0.5) {
-      float dy = 0.0;
-      ${ORBIT_DENTS}
-      float rippleR = length(p.xz);
-      float lake = smoothstep(5.5, 11.0, rippleR);
-      dy += (sin(dot(p.xz, vec2(0.14, 0.10)) + clock * 0.55)
-           + 0.6 * sin(dot(p.xz, vec2(-0.08, 0.13)) + clock * 0.38 + 2.3))
-          * 0.17 * lake;
-      return vec3(p.x, p.y + dy, p.z);
-    }
+    ${GIANT_CONSTS}
     if (abs(spin) < 1e-4) return p;
+    if (spin < -0.5) {
+      float k = -spin - 2.0;
+      float W = 0.0;
+      float PH = 0.0;
+      float RE = 5.0;
+      ${FLARE_TABLE}
+      float cyc = fract(clock * GIANT_FLARE_RATE + PH);
+      float burst = smoothstep(0.0, 0.05, cyc) * (1.0 - smoothstep(0.09, 0.22, cyc));
+      float loft = pow(burst, 0.68);
+      float base = max(length(p), 1e-4);
+      vec3 n = p / base;
+      vec3 q = mix(n * GIANT_R, p, loft);
+      q += n * pow(max(cyc - 0.09, 0.0) * 6.0, 2.0) * RE * 0.55;
+      float a1 = W * clock;
+      float s1 = sin(a1);
+      float c1 = cos(a1);
+      return tilt * vec3(c1 * q.x + s1 * q.z, q.y, -s1 * q.x + c1 * q.z);
+    }
     if (spin < 90.0) {
       float a = spin * clock;
       float s = sin(a);
       float c = cos(a);
-      return vec3(c * p.x + s * p.z, p.y, -s * p.x + c * p.z);
+      return tilt * vec3(c * p.x + s * p.z, p.y, -s * p.x + c * p.z);
     }
     float enc = spin - 100.0;
     float k = floor(enc * 0.1);
-    float w2 = enc - k * 10.0;
-    vec2 C = vec2(0.0);
+    float w2 = enc - k * 10.0 - 5.0;
+    vec3 ax = vec3(0.0, 1.0, 0.0);
     float W = 0.0;
-    ${ORBIT_TABLE}
+      ${STORM_TABLE}
     float a2 = w2 * clock;
     float s2 = sin(a2);
     float c2 = cos(a2);
-    vec2 d = vec2(p.x - C.x, p.z - C.y);
-    vec2 e = vec2(c2 * d.x + s2 * d.y, -s2 * d.x + c2 * d.y);
-    vec2 q2 = C + e;
+    vec3 q = p * c2 + cross(ax, p) * s2 + ax * dot(ax, p) * (1.0 - c2);
     float a1 = W * clock;
     float s1 = sin(a1);
     float c1 = cos(a1);
-    return vec3(c1 * q2.x + s1 * q2.y, p.y, -s1 * q2.x + c1 * q2.y);
+    return tilt * vec3(c1 * q.x + s1 * q.z, q.y, -s1 * q.x + c1 * q.z);
   }
   vec3 q = p - pivot;
   if (mode == 4) {
@@ -420,6 +387,14 @@ vec3 shape(vec3 p, float spin, int mode, mat3 tilt, float clock, vec3 pivot) {
 }
 
 float transportVisibility(vec3 p, float spin, int mode, float clock) {
+  if (mode == 8) {
+    if (spin > -0.5) return 1.0;
+    float k = -spin - 2.0;
+    float PH = 0.0;
+    ${FLARE_PHASE}
+    float cyc = fract(clock * ${g5(GIANT.flareRate)} + PH);
+    return smoothstep(0.0, 0.035, cyc) * (1.0 - smoothstep(0.11, 0.24, cyc));
+  }
   if (mode == 7 && spin < 0.0) {
     ${EJECT_CONSTS}
     float distance = mod(length(p) - EJECT_START + clock * EJECT_SPEED, EJECT_SPAN) + EJECT_START;
@@ -647,14 +622,6 @@ void main() {
   float jb = mix(jetBase(position, uPivotA, aAttrA.w, uModeA), jetBase(aPosB, uPivotB, aAttrB.w, uModeB), e);
   vLum *= 1.0 + jb * uPulse * 0.55 * (0.5 + 0.5 * sin(uPulseClock * 6.2831853));
   vLum *= 1.0 + 0.05 * dust * sin((uClockA + uClockB) * (1.7 + 2.8 * fract(aSeed * 3.7)) + aSeed * 41.0);
-  float wk = 0.0;
-  if (uModeA == 8 && aAttrA.w < -0.5) wk += (1.0 - e) * sheetWake(position, uClockA);
-  if (uModeB == 8 && aAttrB.w < -0.5) wk += e * sheetWake(aPosB, uClockB);
-  vLum *= 1.0 + 0.45 * max(0.0, wk) - 0.12 * max(0.0, -wk);
-  float ecl = 0.0;
-  if (uModeA == 8) ecl += (1.0 - e) * satelliteShadow(position, aAttrA.w, uClockA);
-  if (uModeB == 8) ecl += e * satelliteShadow(aPosB, aAttrB.w, uClockB);
-  vLum *= 1.0 - 0.72 * clamp(ecl, 0.0, 1.0);
   float spk = mix(perihelionSpark(pa, aAttrA.w, uModeA, uPivotA), perihelionSpark(pb, aAttrB.w, uModeB, uPivotB), e);
   vLum *= 1.0 + 0.55 * spk;
   vLum *= mix(holeDim(position, uPivotA, uModeA), holeDim(aPosB, uPivotB, uModeB), e);

@@ -150,12 +150,17 @@ export const CHAPTERS = Object.freeze([
     pulse: 0.9, pulseRate: 0.22, pulseWidth: 1.0, streak: 0.15,
     haze: 0, hazeMix: 0.5, temp: -0.04, sat: 0.94,
   }),
-  chapter('education', '#education', 'planetary', [0, 12, 76], [0, -4, 0], 42, {
-    morphStart: 0.01, morphEnd: 0.99, arc: 1.0, stagger: 0.22,
-    opacity: 0.84, noise: 0.12, noiseScale: 0.05, bloom: 0.3, bloomThreshold: 1.0,
-    focus: 76, focusRange: 120, dof: 0, bokeh: 0, streak: 0.55,
-    narrowPull: 1.8,
-    haze: 0, hazeScale: 0.7, hazeMix: 0.4, temp: -0.12, sat: 0.96,
+  chapter('education', '#education', 'planetary', [3, 4.5, 72], [0, 0, 0], 41, {
+    morphStart: 0.01, morphEnd: 0.99, arc: 1.6, stagger: 0.26,
+    size: 1.05, opacity: 0.7, noise: 0.9, noiseScale: 0.05, noiseSpeed: 0.034,
+    warm: 0.5, clockRate: 0.38, streak: 0.8,
+    pulse: 0.42, pulseRate: 0.12, pulseWidth: 1.0,
+    bloom: 0.46, bloomThreshold: 0.42, bloomTight: 1.0, bloomWide: 0.5,
+    focus: 72, focusRange: 70, dof: 0.5, bokeh: 0.55, vignette: 0.58,
+    fogNear: 46, fogFar: 300, fogTint: 0.42,
+    narrowPull: 1.25,
+    haze: 0, hazeScale: 0.7, hazeMix: 0.85,
+    exposure: 1.05, temp: 0.14, sat: 1.45, contrast: 1.12,
   }),
   chapter('projects', '#projects', 'galaxy', [0, 28, 44], [0, 0, -2], 44, {
     morphStart: 0.01, morphEnd: 0.85, arc: 1.0, stagger: 0.3,
@@ -237,10 +242,14 @@ export const REDUCED_CHAPTERS = Object.freeze([
     pulse: 0.6, pulseRate: 0.1, pulseWidth: 1.0, narrowPull: 2.1,
     chroma: 0, haze: 0, hazeMix: 0.5,
   }),
-  chapter('education', '#education', 'planetary', [0, 12.5, 78], [0, -4, 0], 42, {
-    noise: 0.1, noiseSpeed: 0.014, bloom: 0.3, dof: 0, clockRate: 0.06,
-    narrowPull: 1.8,
-    chroma: 0, haze: 0, temp: -0.1,
+  chapter('education', '#education', 'planetary', [3, 4.5, 74], [0, 0, 0], 41, {
+    size: 1.05, opacity: 0.7, noise: 0.3, noiseSpeed: 0.012, bloom: 0.4,
+    dof: 0.3, bokeh: 0.4,
+    focus: 74, focusRange: 74, clockRate: 0.05,
+    warm: 0.3, pulse: 0.2, pulseRate: 0.05, vignette: 0.55,
+    fogNear: 46, fogFar: 300, fogTint: 0.42,
+    narrowPull: 1.25,
+    chroma: 0, haze: 0, hazeMix: 0.85, temp: 0.14, sat: 1.4,
   }),
   chapter('projects', '#projects', 'galaxy', [0, 22, 54], [0, 0, 0], 44, {
     morphStart: 0.01, morphEnd: 0.68,

@@ -29,28 +29,93 @@ export const TOUCH = Object.freeze({
   SCRAMBLE: 12,
 });
 
-/* The planetary system's four orbits. R is the orbital radius, rate the angular
-   speed, body the size of the planet itself, and depth/width the dent it presses
-   into the grid of spacetime beneath it.
+/* ── The gas giant ────────────────────────────────────────────────────────
 
-   Both sides need these. formations/planetary.js uses them at bake time to
-   brighten the grid at each orbital radius, and shaders/particles.js uses them
-   every frame to push the grid down beneath each planet's current position. Move
-   a number here and both follow; hardcode it on one side and the dent drifts
-   away from the planet that is supposed to be making it. */
-export const ORBIT_PLANETS = Object.freeze([
-  { R: 12.5, phase: 2.7, rate: 0.16, depth: 5.6, width: 4.2, body: 2.9 },
-  { R: 18.0, phase: 5.84, rate: 0.16, depth: 4.2, width: 3.3, body: 2.0 },
-  { R: 27.5, phase: 0.9, rate: 0.125, depth: 2.2, width: 2.3, body: 1.25 },
-  { R: 37.5, phase: 5.5, rate: 0.085, depth: 1.3, width: 1.7, body: 0.95 },
+   MODE.ORBIT belongs entirely to formations/planetary.js: one massive luminous
+   proto-star, rendered from nothing but points. Everything the body does after
+   it is baked is driven by the tables below, and both sides read them.
+   planetary.js uses them at bake time to place cloud, storm and flare
+   particles; shaders/particles.js splices them into GLSL so the same numbers
+   move those particles every frame. Change one here and both follow. */
+export const GIANT = Object.freeze({
+  radius: 15.0,
+  // Axial tilt, applied as the formation's tilt matrix. Only the rotating
+  // populations get it; the view-locked limb, corona and star field are baked
+  // in world space and skip it (their spin is 0, which the shader passes
+  // through untouched).
+  tilt: { x: -0.26, z: 0.19 },
+  // Eruption cycles per unit of formation clock, shared by every flare site.
+  flareRate: 0.035,
+});
+
+/* The zonal wind profile: angular rate about the spin axis as a function of
+   sin(latitude), sampled at 17 evenly spaced knots from the south pole (-1) to
+   the north pole (+1). The alternation is the point — neighbouring knots are
+   fast and slow jets, so the cloud deck shears against itself and a storm at
+   one latitude slowly laps a storm at the next. The equator super-rotates.
+
+   Cloud particles get their own knot-interpolated rate baked into `spin`, so
+   the differential rotation costs the shader nothing. Flares read the same
+   curve through the generated GLSL below, which is why an eruption drifts with
+   the band it came out of instead of with the body as a whole. */
+export const GIANT_JETS = Object.freeze([
+  0.086, 0.104, 0.152, 0.121, 0.186, 0.148, 0.223, 0.181, 0.298,
+  0.192, 0.236, 0.158, 0.201, 0.134, 0.163, 0.112, 0.092,
 ]);
 
-// The per-particle `spin` attribute is overloaded. Below 90 it is a literal
-// angular rate; from 100 up it is a tag the shader decodes back into "which
-// body does this particle belong to", with the rate packed into the fractional
-// part. Bands: 100+ orbit satellites, 200+ nucleus shells, 500+ reaction planes.
-// It saves spending a whole extra per-particle attribute on a small enum.
-export const orbitSatelliteSpin = (planetIndex, rate) => 100 + planetIndex * 10 + rate;
+export function zonalRate(sinLat) {
+  const n = GIANT_JETS.length - 1;
+  const t = Math.min(n, Math.max(0, (sinLat + 1) * 0.5 * n));
+  const i = Math.min(n - 1, Math.floor(t));
+  const f = t - i;
+  return GIANT_JETS[i] + (GIANT_JETS[i + 1] - GIANT_JETS[i]) * f;
+}
+
+/* Long-lived vortices. `lat`/`lon` place the storm on the body in radians, `r`
+   is its radius in body units, `w` the peak swirl rate at its core, and `share`
+   its slice of the storm particle budget.
+
+   There are deliberately none at the poles. A polar cyclone is centred on the
+   rotation axis, so the shader rotates it about its own centre and it never
+   moves on screen; it lands on the polar hood, which is the dimmest part of
+   the deck; and being collar-weighted it is a ring. A stationary bright ring
+   on the dimmest part of the limb reads as a hoop floating beside the disc,
+   not as weather. The deck's own polar hood carries the poles instead. */
+export const GIANT_STORMS = Object.freeze([
+  { lat: -0.30, lon: 1.15, r: 3.35, w: 0.30, sense: 1, tint: 2.95, lum: 1.0, share: 0.36 },
+  { lat: 0.52, lon: -1.90, r: 2.10, w: 0.34, sense: -1, tint: 2.60, lum: 0.95, share: 0.21 },
+  { lat: -0.62, lon: 2.60, r: 1.55, w: 0.38, sense: 1, tint: 2.5, lum: 1.1, share: 0.14 },
+  { lat: 0.24, lon: 2.95, r: 1.25, w: 0.40, sense: -1, tint: 2.78, lum: 0.9, share: 0.11 },
+  { lat: -0.14, lon: -0.55, r: 1.05, w: 0.42, sense: 1, tint: 2.54, lum: 0.95, share: 0.08 },
+  { lat: 0.78, lon: 0.35, r: 1.35, w: 0.33, sense: -1, tint: 2.88, lum: 0.85, share: 0.10 },
+]);
+
+/* Eruption sites. `phase` offsets each one in the shared flare cycle so they
+   fire one or two at a time rather than together — the active part of the
+   cycle is about a fifth of it, which with nine sites keeps roughly two
+   erupting at any moment; `reach` is how far the plume throws in body units
+   and `curl` how far the zonal wind bends it over. Bend matters: a plume that
+   only rises reads as a spike stuck to the limb rather than as an arc. */
+export const GIANT_FLARES = Object.freeze([
+  { lat: 0.10, lon: 0.30, phase: 0.00, reach: 5.0, curl: 0.95 },
+  { lat: -0.46, lon: 2.10, phase: 0.12, reach: 3.6, curl: -0.72 },
+  { lat: 0.66, lon: -1.20, phase: 0.23, reach: 4.1, curl: 0.6 },
+  { lat: -0.18, lon: -2.55, phase: 0.34, reach: 5.6, curl: 1.05 },
+  { lat: 0.34, lon: 1.85, phase: 0.45, reach: 3.3, curl: -0.5 },
+  { lat: -0.82, lon: 0.95, phase: 0.56, reach: 4.4, curl: 0.8 },
+  { lat: 0.02, lon: -0.70, phase: 0.68, reach: 6.4, curl: 1.2 },
+  { lat: -0.58, lon: -1.65, phase: 0.79, reach: 3.9, curl: -0.62 },
+  { lat: 0.88, lon: 2.70, phase: 0.90, reach: 4.6, curl: 0.7 },
+]);
+
+/* The per-particle `spin` attribute is overloaded. Below 90 it is a literal
+   angular rate; from 100 up it is a tag the shader decodes back into "which
+   body does this particle belong to", with the rate packed into the fractional
+   part. Bands: 100+ giant storms, 200+ nucleus shells, 500+ reaction planes.
+   Negative values below -0.5 are the second tag space, currently the giant's
+   flare sites. It saves spending a whole extra attribute on a small enum. */
+export const stormSpin = (index, rate) => 100 + index * 10 + 5 + rate;
+export const flareSpin = (index) => -(2 + index);
 
 // Eight electron shells for the nucleus, each tumbling about its own axis. The
 // axes are pre-normalised and irregular on purpose: evenly spaced ones would

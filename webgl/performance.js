@@ -71,13 +71,30 @@ export const FRAME_INTERVAL_MS = 1000 / TARGET_FPS;
    or beyond the target rather than the nearest one. On a 144Hz panel (6.94ms per
    refresh) refresh 2 lands at 13.9ms and gets rejected, so it can only ever
    present on refresh 3 at 20.8ms: a locked 48fps, and a visible beat. Backing the
-   threshold off by half a refresh lets it alternate between refresh 2 and 3 and
-   average out at 60.
+   threshold off by half a refresh picks the multiple NEAREST the target instead,
+   so 144Hz settles on refresh 2 and runs a steady 72fps.
+
+   There is no alternation and no averaging: the caller resets its clock to each
+   presented frame, so a given panel locks onto one multiple and stays there.
+   60 is the target, not the outcome - the outcome is the achievable rate closest
+   to it (144Hz -> 72fps, 165Hz -> 55fps, 100Hz -> 50fps). presentPeriod() below
+   is that outcome expressed as a period, and anything judging the machine has to
+   judge it against that rather than against 60fps flat.
 
    Never gate presentation on a multiple of the refresh period. */
 export function shouldPresent(sinceLastPresent, vsync) {
   if (!Number.isFinite(vsync) || vsync <= 0) return true;
   return sinceLastPresent >= FRAME_INTERVAL_MS - vsync * 0.5;
+}
+
+/* The cadence shouldPresent() will actually produce on a panel of this period:
+   the smallest whole number of refreshes that clears the same threshold. Derived
+   from FRAME_INTERVAL_MS and vsync exactly as the comparison above is, so the two
+   cannot disagree - including at the borderline (90Hz sits on the knife edge, and
+   both land on the same side of it). */
+export function presentPeriod(vsync) {
+  if (!Number.isFinite(vsync) || vsync <= 0) return FRAME_INTERVAL_MS;
+  return Math.max(1, Math.ceil(FRAME_INTERVAL_MS / vsync - 0.5)) * vsync;
 }
 
 const WINDOW = 120;      // frame times held for percentiles, about 2s at 60fps
@@ -91,6 +108,17 @@ const PERIOD_MIN = 2.0;
 const PERIOD_MAX = 17.5;
 
 const COMFORT_MS = 1000 / 60;
+
+// The slowest presented cadence we are willing to read as "this is just what the
+// panel does" rather than "this machine is in trouble". 22.5ms is ~44fps, which
+// covers every real slow panel once the cap has quantised it - 45Hz and 90Hz both
+// land on 22.2ms, 48Hz and 96Hz on 20.8ms, 50Hz and 100Hz on 20.0ms.
+//
+// It has to stay below 60Hz-dropping-every-other-frame (33.3ms), because that is
+// what an overloaded machine looks like: rAF stops firing on every boundary, the
+// period estimate rises with the load, and a budget that followed it there would
+// excuse the very slowness the ladder exists to fix.
+const CADENCE_MAX = 22.5;
 
 // Asymmetric on purpose: the gap between them is a dead band where nothing
 // happens, which is what stops a device sitting exactly on budget from
@@ -142,7 +170,7 @@ export class PerformanceManager {
     this.lastEval = 0;
   }
 
-  sample(dtMs, now) {
+  sample(dtMs, now, vsync) {
     // Anything over 250ms is a stall, not a slow frame: a backgrounded tab, a
     // debugger pause, the compositor blocking. Including it would poison the
     // percentiles and demote a machine that is running fine.
@@ -172,9 +200,24 @@ export class PerformanceManager {
     // refresh period: no frame can be quicker than one refresh.
     const period = Math.min(PERIOD_MAX, Math.max(PERIOD_MIN, sorted[0]));
     stats.period = period;
-    // Never demand better than 60fps of a slow panel, and never demand better
-    // than the panel can physically deliver.
-    const budget = Math.max(COMFORT_MS, period);
+    /* Never demand better than 60fps of a slow panel, and never demand better
+       than the panel can physically deliver.
+
+       The second half of that is why the cap's own cadence is the reference and
+       not the frame times. Presented deltas are quantised to whole refreshes, so
+       on a 100Hz panel the only cadences the cap can produce are 10ms and 20ms,
+       and it picks 20ms. Judging that against 16.7ms leaves the ratio at 1.14 -
+       inside the dead band, which clears goodStreak every window, so a session
+       that ever dropped a rung could never climb back no matter how idle the
+       machine went. Same arithmetic parked 45, 48, 50, 90 and 96Hz.
+
+       vsync is the caller's minimum-gap estimate of the panel period; without it
+       we fall back to the observed period, which is what the offline harnesses
+       that drive sample() directly still get. */
+    const cadence = Number.isFinite(vsync) && vsync > 0
+      ? Math.min(CADENCE_MAX, presentPeriod(vsync))
+      : period;
+    const budget = Math.max(COMFORT_MS, cadence);
     stats.budget = budget;
 
     // Judged on the median, not the average: one 80ms hitch should not demote a
