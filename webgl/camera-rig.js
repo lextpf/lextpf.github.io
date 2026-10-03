@@ -1,6 +1,6 @@
 
 import * as THREE from './lib/three.js';
-import { damp } from './lib/random.js';
+import { damp, easeInOutSine } from './lib/random.js';
 
 export class CameraRig {
   constructor(aspect) {
@@ -11,6 +11,8 @@ export class CameraRig {
     this.pos = new THREE.Vector3(0, 0, 64);
     this.look = new THREE.Vector3(0, 0, 0);
     this.fov = 40;
+    // Horizontal lens shift, in half-widths of the screen (see _applyLens).
+    this.frameX = 0;
     this.parallax = new THREE.Vector2(0, 0);
     this.travel = 0;
 
@@ -24,14 +26,41 @@ export class CameraRig {
 
   setAspect(aspect) {
     this.camera.aspect = aspect;
-    this.camera.updateProjectionMatrix();
+    this._applyLens();
+  }
+
+  /* The lens shift is three's native film offset, so unproject (the pointer
+     ray) and projectSphere (the horizon) see the same shifted frustum the
+     particles are drawn with. Scaled so frameX is an NDC offset: 0.25 moves the
+     subject a quarter of the half-width to the right, at any fov or aspect. */
+  _applyLens() {
+    const cam = this.camera;
+    cam.fov = this.fov;
+    cam.filmOffset = -this.frameX * cam.aspect * Math.tan((cam.fov * Math.PI) / 360) * cam.getFilmWidth();
+    cam.updateProjectionMatrix();
   }
 
   update(state, pointer, dt, elapsed) {
     this._prev.copy(this.pos);
     this.pos.set(state.camX, state.camY, state.camZ);
     this.look.set(state.tgtX, state.tgtY, state.tgtZ);
-    this.fov = state.fov;
+
+    // The hold: while a chapter is read the camera eases a few percent toward
+    // its subject and, where a chapter asks for it, turns a fraction of a degree
+    // about world Y. Both are 0 at hold 0, so the authored frame is where the
+    // camera arrives, and the ease starts and ends with zero velocity.
+    const h = easeInOutSine(state.hold || 0);
+    const push = (state.holdPush || 0) * h;
+    if (push) this.pos.lerp(this.look, push);
+    const yaw = ((state.holdYaw || 0) * h * Math.PI) / 180;
+    if (yaw) {
+      const dx = this.pos.x - this.look.x;
+      const dz = this.pos.z - this.look.z;
+      const c = Math.cos(yaw);
+      const sn = Math.sin(yaw);
+      this.pos.x = this.look.x + dx * c + dz * sn;
+      this.pos.z = this.look.z - dx * sn + dz * c;
+    }
 
     // How fast the authored camera is flying, normalised and smoothed.
     const speed = dt > 0 ? this._prev.distanceTo(this.pos) / dt : 0;
@@ -57,9 +86,11 @@ export class CameraRig {
     );
     cam.lookAt(this.look);
     // Rebuilding the projection matrix is not free, so only on a real change.
-    if (Math.abs(cam.fov - this.fov) > 0.001) {
-      cam.fov = this.fov;
-      cam.updateProjectionMatrix();
+    const frameX = state.frameX || 0;
+    if (Math.abs(this.fov - state.fov) > 1e-4 || Math.abs(this.frameX - frameX) > 1e-4) {
+      this.fov = state.fov;
+      this.frameX = frameX;
+      this._applyLens();
     }
   }
 
