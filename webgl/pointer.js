@@ -14,6 +14,12 @@ export class PointerController {
     this._targetY = 0;
     this._active = 0;
     this._idle = 0;
+    // The stir's own read (shaders/particles.js touchStir): hx, hy follow the
+    // cursor closely and `hover` holds while it rests anywhere in the window.
+    this.hx = 0;
+    this.hy = 0;
+    this.hover = 0;
+    this._inside = 0;
 
     // Normalise to -1..1 with the origin at the centre of the viewport.
     this._onMove = (event) => {
@@ -22,9 +28,16 @@ export class PointerController {
       this._targetY = (event.clientY / innerHeight) * 2 - 1;
       this._active = 1;
       this._idle = 0;
+      // First contact: the stir starts under the cursor, not at the centre.
+      if (this.hover < 0.01) {
+        this.hx = this._targetX;
+        this.hy = this._targetY;
+      }
+      this._inside = 1;
     };
     this._onLeave = () => {
       this._active = 0;
+      this._inside = 0;
     };
 
     if (this.enabled) {
@@ -41,6 +54,13 @@ export class PointerController {
   }
 
   update(dt) {
+    // The stir holds while the cursor rests (no idle cut) and fades only when
+    // it leaves; the ladder's parallax scale does not cut it.
+    if (this.enabled) {
+      this.hx = damp(this.hx, this._targetX, 16, dt);
+      this.hy = damp(this.hy, this._targetY, 16, dt);
+      this.hover = damp(this.hover, this._inside, 7, dt);
+    }
     if (!this.enabled || this.scale <= 0) {
       this.strength = 0;
       return this;
