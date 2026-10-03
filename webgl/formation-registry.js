@@ -36,18 +36,31 @@ export class FormationRegistry {
       get cursor() {
         return cursor;
       },
+      // The slots the next n writes will land in, in write order. A copy, so
+      // the shared shuffle itself is never exposed, and reading ahead changes
+      // nothing: write() still takes order[cursor++]. A structure ranks these
+      // slots to place its writes so that every ladder cut keeps an even
+      // subset of it (lib/sampling.js).
+      ahead(n) {
+        return order.slice(cursor, Math.min(count, cursor + Math.max(0, n)));
+      },
       /* Place one particle.
 
          The important detail: this writes to order[cursor], not to cursor. Every
          generator's output is scattered through the buffer by the shared
          permutation.
 
-         That is what makes a morph look right. Each particle carries its own
-         `stagger`, and the vertex shader uses it to decide when that particle
-         starts moving, so a morph is a wave rather than a cut. In generator
-         order that wave would sweep the shape the way the generator happened to
-         emit it, an arm or a shell at a time, and read as a wipe. Scattered, the
-         same wave lands all over the shape at once and reads as a dissolve. */
+         What it buys: the quality ladder cuts particles by drawing only the
+         first N slots, so a cut removes a uniform random sample of every
+         formation instead of whole arms or shells in the order the generator
+         emitted them.
+
+         The authored `stagger` argument does NOT drive morph timing. It lands
+         in attr.z, which the shader reads as the pulse phase. When a particle
+         departs comes from its slot seed (fract(aSeed * 317.71)) scaled by the
+         chapter's `stagger` span, so a morph is a random, spatially uniform
+         dissolve. Wiring the authored order back into timing produces a
+         directional wipe; _check_morph_ordering.mjs guards against that. */
       write(x, y, z, size, tint, stagger, spin, rigidity) {
         if (cursor >= count) return;
         const slot = order[cursor++];
