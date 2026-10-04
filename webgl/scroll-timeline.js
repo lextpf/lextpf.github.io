@@ -76,7 +76,7 @@ const POST_KEYS = STATE_KEYS.filter(
 // they belong to the departing chapter and are constant through its band, never
 // blended: a stagger that changes while particles are in flight can push them
 // backwards, and a pinch blended on the post head runs at half strength.
-const TRANSITION_KEYS = ['stagger', 'arc', 'pinch', 'vortex', 'scatter', 'warp', 'camDelay'];
+const TRANSITION_KEYS = ['stagger', 'arc', 'pinch', 'vortex', 'scatter', 'erode', 'warp', 'camDelay'];
 
 export class ScrollTimeline {
   constructor(chapters, options = {}) {
