@@ -2,7 +2,7 @@
 import * as THREE from './lib/three.js';
 import { particleVertex, particleFragment } from './shaders/particles.js';
 import { PALETTE } from './chapters.js';
-import { MODE, TUNNEL, HOLE_LENS, JET_BEND, HOLE_FX } from './lib/modes.js';
+import { MODE, TUNNEL, HOLE_LENS, JET_BEND, HOLE_FX, ERODE } from './lib/modes.js';
 import { LENS_TABLE, buildLensTable } from './lib/lens-table.js';
 import { makeRng, clamp } from './lib/random.js';
 import { BLACK_HOLE_HORIZON } from './formations/blackhole.js';
@@ -38,6 +38,12 @@ function tiltMatrix(tilt) {
   ));
   return new THREE.Matrix3().setFromMatrix4(m4);
 }
+
+// The rows the portrait's erosion measures its departing edge in (_erodeBox);
+// shaders/particles.js declares uErodeRow at this length.
+const ERODE_ROWS = 24;
+// About how many slots _erodeBox reads, whatever the particle count.
+const ERODE_SAMPLE = 20000;
 
 export class ParticleSystem {
   constructor(registry, count) {
@@ -157,6 +163,14 @@ export class ParticleSystem {
       uVortex: { value: 0 },
       uPinch: { value: 0 },
       uScatter: { value: 0 },
+      uErode: { value: new THREE.Vector4() },
+      uErodeB: { value: new THREE.Vector4() },
+      uErodeC: { value: new THREE.Vector4() },
+      uErodeD: { value: new THREE.Vector4() },
+      uErodeE: { value: new THREE.Vector4(0, 1, 0, 1) },
+      uErodeF: { value: new THREE.Vector4() },
+      uErodeRow: { value: new Float32Array(ERODE_ROWS) },
+      uErodeRowY: { value: new THREE.Vector2(0, 1) },
       uHand: { value: 1 },
       uViewport: { value: new THREE.Vector2(1536, 864) },
       uTouchA: { value: new THREE.Vector3(7, 0, 0) },
@@ -228,6 +242,9 @@ export class ParticleSystem {
     this.jetBend = { ...JET_BEND };
     // The seventh cut's switches (lib/modes.js HOLE_FX).
     this.fx = { ...HOLE_FX };
+    // The portrait's erosion (lib/modes.js ERODE), copied for the same reason.
+    this.erode = { ...ERODE };
+    this._erodeLast = { a: '', b: '', rows: new Float32Array(ERODE_ROWS), rowY0: 0, rowStep: 1, aWidth: 1, bLeft: 0, bWidth: 1, bTop: 0, bHeight: 1 };
   }
 
   // How the quality ladder cuts cost. The buffers stay at full size and only the
@@ -237,6 +254,95 @@ export class ParticleSystem {
   setActiveCount(n) {
     this.activeCount = clamp(Math.floor(n), 1024, this.count);
     this.geometry.setDrawRange(0, this.activeCount);
+  }
+
+  /* What the portrait's erosion reads of the pair (shaders/particles.js step
+     1b): the departing formation's right edge in ERODE_ROWS rows of its height
+     (each row's 98.5th percentile, so a stray point does not hold the front
+     back, then smoothed) and its width, which the front crosses; and the
+     arriving one's box, over which it condenses. Measured once per pair, over
+     the points each formation shows and the two do not share (the sky), on
+     every step-th slot: the registry writes through a shuffle, so that is an
+     even sample of each formation, and it keeps this to a few milliseconds. */
+  _erodeBox(A, B) {
+    const last = this._erodeLast;
+    if (last.a === A.id && last.b === B.id) return last;
+    const pa = A.pos.array;
+    const pb = B.pos.array;
+    const sa = A.attr.array;
+    const sb = B.attr.array;
+    const step = Math.max(1, Math.floor(this.count / ERODE_SAMPLE));
+    const sx = new Float32Array(Math.ceil(this.count / step));
+    const sy = new Float32Array(sx.length);
+    let n = 0;
+    let bx0 = Infinity, bx1 = -Infinity, by0 = Infinity, by1 = -Infinity;
+    for (let i = 0; i < this.count; i += step) {
+      const k = i * 3;
+      if (pa[k] === pb[k] && pa[k + 1] === pb[k + 1] && pa[k + 2] === pb[k + 2]) continue;
+      if (sa[i * 4] > 0) {
+        sx[n] = pa[k];
+        sy[n] = pa[k + 1];
+        n++;
+      }
+      if (sb[i * 4] > 0) {
+        bx0 = Math.min(bx0, pb[k]);
+        bx1 = Math.max(bx1, pb[k]);
+        by0 = Math.min(by0, pb[k + 1]);
+        by1 = Math.max(by1, pb[k + 1]);
+      }
+    }
+    const at = (sorted, q) => sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(q * (sorted.length - 1))))];
+    const rows = new Float32Array(ERODE_ROWS);
+    let rowY0 = 0;
+    let rowStep = 1;
+    let aWidth = 1;
+    const ax = sx.subarray(0, n);
+    const ay = sy.subarray(0, n);
+    if (n >= 100) {
+      const xs = ax.slice().sort();
+      const ys = ay.slice().sort();
+      const y0 = at(ys, 0.005);
+      rowStep = Math.max((at(ys, 0.995) - y0) / ERODE_ROWS, 1e-3);
+      rowY0 = y0 + rowStep / 2;
+      const bins = Array.from({ length: ERODE_ROWS }, () => []);
+      for (let i = 0; i < n; i++) {
+        const b = Math.floor((ay[i] - y0) / rowStep);
+        if (b >= 0 && b < ERODE_ROWS) bins[b].push(ax[i]);
+      }
+      const raw = bins.map((b) => (b.length >= 30 ? at(Float32Array.from(b).sort(), 0.985) : NaN));
+      const fallback = at(xs, 0.985);
+      for (let b = 0; b < ERODE_ROWS; b++) {
+        let v = raw[b];
+        for (let d = 1; Number.isNaN(v) && d < ERODE_ROWS; d++) {
+          if (b - d >= 0 && !Number.isNaN(raw[b - d])) v = raw[b - d];
+          else if (b + d < ERODE_ROWS && !Number.isNaN(raw[b + d])) v = raw[b + d];
+        }
+        rows[b] = Number.isNaN(v) ? fallback : v;
+      }
+      for (let pass = 0; pass < 2; pass++) {
+        const r = rows.slice();
+        for (let b = 0; b < ERODE_ROWS; b++) {
+          rows[b] = 0.25 * r[Math.max(0, b - 1)] + 0.5 * r[b] + 0.25 * r[Math.min(ERODE_ROWS - 1, b + 1)];
+        }
+      }
+      let right = -Infinity;
+      for (let b = 0; b < ERODE_ROWS; b++) right = Math.max(right, rows[b]);
+      aWidth = Math.max(right - at(xs, 0.015), 1e-3);
+    }
+    const ok = (lo, hi) => Number.isFinite(lo) && hi - lo > 1e-3;
+    this._erodeLast = {
+      a: A.id,
+      b: B.id,
+      rows,
+      rowY0,
+      rowStep,
+      aWidth,
+      bLeft: ok(bx0, bx1) ? bx0 : 0,
+      bWidth: ok(bx0, bx1) ? bx1 - bx0 : 1,
+      bTop: ok(by0, by1) ? by1 : 0,
+      bHeight: ok(by0, by1) ? by1 - by0 : 1,
+    };
+    return this._erodeLast;
   }
 
   _find(id) {
@@ -475,6 +581,27 @@ export class ParticleSystem {
     u.uVortex.value = state.vortex || 0;
     u.uPinch.value = state.pinch || 0;
     u.uScatter.value = state.scatter || 0;
+    /* The portrait's erosion (shaders/particles.js step 1b), while the
+       departing chapter's `erode` asks for it and the pair is mid-morph (at
+       either end the ordinary path is exactly the same, and cheaper): 1 is
+       the authored motion, lower is calmer, 0 the ordinary morph. The
+       motion's reach scales with it; the front and the timing do not. */
+    const E = this.erode;
+    const morphNow = state.morph || 0;
+    const wantErode = Math.max(0, state.erode || 0);
+    // Measured while the portrait is still held, so the first scroll pays
+    // nothing; until it is, the pair morphs the ordinary way.
+    const box = wantErode > 0 && !this.pendingB ? this._erodeBox(A, B) : this._erodeLast;
+    const measured = box.a === A.id && box.b === B.id;
+    const erode = measured && morphNow > 0 && morphNow < 1 ? wantErode : 0;
+    u.uErode.value.set(erode, 0, box.aWidth, E.sweep);
+    u.uErodeRow.value.set(box.rows);
+    u.uErodeRowY.value.set(box.rowY0, box.rowStep);
+    u.uErodeB.value.set(E.edge, E.grain, E.jitter, E.loosen);
+    u.uErodeC.value.set(E.flightMin, E.flightMax, E.pull * erode, E.swirl * erode);
+    u.uErodeD.value.set(E.lift * erode, E.tremble * erode, E.landFrom, E.landTo);
+    u.uErodeE.value.set(box.bLeft, box.bWidth, box.bTop, box.bHeight);
+    u.uErodeF.value.set(E.via, E.keep, E.glint, E.dim);
     // One bow handedness for the whole cloud, alternating per chapter pair. It
     // flips only at a pair rollover, where the morph sits at an endpoint and
     // the bow term is zero, so the flip is never visible.
