@@ -735,6 +735,23 @@ const BAD_WINDOWS = 3;   // drop fast, three bad windows is under a second
 const GOOD_WINDOWS = 5;  // climb slowly
 const MAX_ATTEMPTS = 2;  // give up on a rung after this many failures
 
+/* The frame time a machine is judged against: 60fps, or the cadence the cap can
+   actually produce on this panel where that is slower (but never past
+   CADENCE_MAX).
+
+   The cap's own cadence is the reference, not the frame times. Presented deltas
+   are quantised to whole refreshes, so on a 100Hz panel the only cadences the cap
+   can produce are 10ms and 20ms, and it picks 20ms; judged against 16.7ms that is
+   a ratio of 1.14 forever. vsync is the VsyncEstimator's period; without it
+   (offline harnesses that drive sample() directly) the fastest observed frame,
+   `period`, stands in. */
+export function frameBudget(vsync, period) {
+  const cadence = Number.isFinite(vsync) && vsync > 0
+    ? Math.min(CADENCE_MAX, presentPeriod(vsync))
+    : period;
+  return Math.max(COMFORT_MS, cadence);
+}
+
 export class PerformanceManager {
   constructor(initialTier, onChange) {
     // The boot guess is a hard ceiling, not a starting point. If detectTier said
@@ -807,24 +824,12 @@ export class PerformanceManager {
     const period = Math.min(PERIOD_MAX, Math.max(PERIOD_MIN, sorted[0]));
     stats.period = period;
     /* Never demand better than 60fps of a slow panel, and never demand better
-       than the panel can physically deliver.
-
-       The second half of that is why the cap's own cadence is the reference and
-       not the frame times. Presented deltas are quantised to whole refreshes, so
-       on a 100Hz panel the only cadences the cap can produce are 10ms and 20ms,
-       and it picks 20ms. Judging that against 16.7ms leaves the ratio at 1.14 -
-       inside the dead band, which clears goodStreak every window, so a session
-       that ever dropped a rung could never climb back no matter how idle the
-       machine went. Same arithmetic parked 45, 48, 50, 90 and 96Hz.
-
-       vsync is the VsyncEstimator's period (the lower quartile of the recent rAF
-       gaps, taken to the finest lattice they show); without it we fall back to
-       the observed period, which is what the offline harnesses that drive
-       sample() directly still get. */
-    const cadence = Number.isFinite(vsync) && vsync > 0
-      ? Math.min(CADENCE_MAX, presentPeriod(vsync))
-      : period;
-    const budget = Math.max(COMFORT_MS, cadence);
+       than the panel can physically deliver (frameBudget). Judging a 100Hz
+       panel's 20ms against 16.7ms would leave the ratio at 1.14 - inside the dead
+       band, which clears goodStreak every window, so a session that ever dropped
+       a rung could never climb back no matter how idle the machine went. Same
+       arithmetic parked 45, 48, 50, 90 and 96Hz. */
+    const budget = frameBudget(vsync, period);
     stats.budget = budget;
 
     // Judged on the median, not the average: one 80ms hitch should not demote a
@@ -869,4 +874,92 @@ export class PerformanceManager {
     this.reset();
     this.onChange(this.tier, stats);
   }
+}
+
+/* The quality gate's trial (cv-universe.js): can this machine hold the high rung
+   reliably? Behind the page's loader the universe draws the real picture at
+   TIERS.high, and this judges those presented frames with the ladder's own
+   budget, only stricter. The ladder keeps high up to a median of 1.4x budget; the
+   trial passes a median within 1.1x and a 90th percentile within 1.4x, so at
+   60Hz fewer than one frame in ten misses its refresh. A machine that does not
+   pass gets the page without the universe, never a lower rung.
+
+   It decides as soon as the evidence is there: a pass needs a full window of
+   presented frames whose mean is also within TRIAL_MEAN_AT of the budget (p90
+   counts late frames, not how late: a machine that freezes for 400ms every
+   twelfth frame keeps a 60fps p90), a fail two bad evaluations in a row. Still undecided after
+   TRIAL_MAX_MS of judged frames counts as a fail: a machine that cannot settle
+   within that is not holding high reliably. Unlike the ladder it judges long
+   frames too (a GPU that takes 400ms a frame is the answer, not a stall), and
+   skips only gaps past TRIAL_GAP_MS; the caller leaves out a hidden tab's. */
+const TRIAL_WINDOW = 60;
+const TRIAL_FAIL_WINDOWS = 2;
+const TRIAL_MAX_MS = 3000;
+const TRIAL_GAP_MS = 2000;
+const TRIAL_MEAN_AT = 1.25;
+
+export class QualityTrial {
+  constructor() {
+    this.samples = new Float32Array(TRIAL_WINDOW);
+    this._sorted = new Float32Array(TRIAL_WINDOW);
+    this.filled = 0;
+    this.cursor = 0;
+    this.elapsed = 0;
+    this.lastEval = 0;
+    this.badStreak = 0;
+    this.stats = { p50: 0, p90: 0, mean: 0, budget: COMFORT_MS, frames: 0, elapsed: 0 };
+  }
+
+  // 'pass', 'fail', or null while undecided.
+  sample(dtMs, now, vsync) {
+    if (!(dtMs > 0) || dtMs > TRIAL_GAP_MS) return null;
+    this.samples[this.cursor] = dtMs;
+    this.cursor = (this.cursor + 1) % TRIAL_WINDOW;
+    this.filled = Math.min(this.filled + 1, TRIAL_WINDOW);
+    this.stats.frames++;
+    this.elapsed += dtMs;
+    this.stats.elapsed = this.elapsed;
+    const timedOut = this.elapsed >= TRIAL_MAX_MS;
+    if (!timedOut && (this.filled < MIN_SAMPLES || (this.lastEval && now - this.lastEval < EVAL_MS))) return null;
+    this.lastEval = now;
+
+    const n = this.filled;
+    const sorted = this._sorted.subarray(0, n);
+    sorted.set(this.samples.subarray(0, n));
+    sorted.sort();
+    const at = (p) => sorted[Math.min(n - 1, Math.floor(n * p))];
+    let total = 0;
+    for (let i = 0; i < n; i++) total += sorted[i];
+    const stats = this.stats;
+    stats.p50 = at(0.5);
+    stats.p90 = at(0.9);
+    stats.mean = total / n;
+    stats.budget = frameBudget(vsync, Math.min(PERIOD_MAX, Math.max(PERIOD_MIN, sorted[0])));
+
+    // Too few frames inside the cap to judge at all: as slow as it gets.
+    if (n < MIN_SAMPLES) return 'fail';
+    if (stats.p50 > stats.budget * DOWNGRADE_AT) {
+      if (++this.badStreak >= TRIAL_FAIL_WINDOWS) return 'fail';
+    } else {
+      this.badStreak = 0;
+    }
+    if (n >= TRIAL_WINDOW && stats.p50 <= stats.budget * UPGRADE_AT && stats.p90 <= stats.budget * DOWNGRADE_AT &&
+      stats.mean <= stats.budget * TRIAL_MEAN_AT) {
+      return 'pass';
+    }
+    return timedOut ? 'fail' : null;
+  }
+}
+
+/* The refresh the trial's budget is judged against. Under the trial's load the
+   callbacks can thin out to a whole multiple of the refresh (a 240Hz panel
+   presenting every 5th) and the estimator's period rises with them, judging a
+   48fps machine against a 48Hz panel. The period the same estimator held while
+   the programs compiled and the GPU was idle undoes such a multiple, and only
+   that: it never asks for a finer cadence than the estimator itself sees, so a
+   reading thrown low by late stamps cannot fail a 100Hz panel's 20ms. */
+export function trialRefresh(vsync, idle) {
+  if (!Number.isFinite(vsync) || !(idle > 0) || !Number.isFinite(idle)) return vsync;
+  const k = Math.round(vsync / idle);
+  return k >= 2 && Math.abs(vsync - k * idle) <= 0.1 * idle ? vsync / k : vsync;
 }
