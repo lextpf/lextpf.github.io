@@ -7,8 +7,7 @@ import { slotRanks, fpsOrder, progressiveGrid } from '../lib/sampling.js';
 
    The parts the nucleus is built from: lit beads (nucleons, electron heads),
    clusters of them, the soft cloud around an atom, electron comets and their
-   orbit traces. Shared with the unregistered reactants.js, so every option a
-   caller does not pass keeps its old meaning.
+   orbit traces.
 
    Every structure here is placed so that a ladder cut keeps an even subset
    of it (lib/sampling.js): a bead takes the farthest-point order of its
@@ -265,20 +264,6 @@ export function electronComet(c, def, nHeadTail, nArc, tintScale) {
       stag - 0.06 + c.rng.range(0, 0.04),
       spin,
       0.95
-    );
-  }
-}
-
-export function fieldDust(c, share) {
-  const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
-  for (let i = 0; i < share; i++) {
-    const r = 26 + 38 * Math.pow(c.rng.unit(), 0.78);
-    const theta = i * GOLDEN_ANGLE;
-    const cosPhi = c.rng.signed();
-    const sinPhi = Math.sqrt(Math.max(0, 1 - cosPhi * cosPhi));
-    c.write(
-      r * sinPhi * Math.cos(theta), r * cosPhi * 0.47, r * sinPhi * Math.sin(theta),
-      c.rng.range(0.14, 0.36), c.rng.range(0, 0.12), 0.88 + c.rng.range(0, 0.12), 0.004, 0
     );
   }
 }
