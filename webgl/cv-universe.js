@@ -1119,8 +1119,13 @@ function supportsWebGL() {
    universe nor the fallback started. */
 const canvas = document.getElementById('cv-universe');
 const params = new URLSearchParams(location.search);
-// ?universe=off forces the DOM fallback, ?universe=debug mounts the slider panel.
+// ?universe=off forces the DOM fallback.
 const flag = params.get('universe');
+// The slider panel (debug.js) is dev only. The page's head probe decides: the
+// source grants it under ?universe=debug and the production build strips that
+// grant, so the deployed page never loads debug.js and the deploy does not need
+// it. A page without the probe (the avatar lab) goes by the URL as before.
+const debug = typeof window.__cvUniverseDebug === 'boolean' ? window.__cvUniverseDebug : flag === 'debug';
 const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 let experience = null;
@@ -1140,7 +1145,7 @@ function enable() {
   try {
     const created = new WebGLExperience(canvas, {
       reduced,
-      debug: flag === 'debug',
+      debug,
       // On trial only while the page waits behind its loader; a console
       // enable() after the verdict runs as it always did.
       trial: gatePending(),
@@ -1152,7 +1157,7 @@ function enable() {
     });
     experience = created;
     experience.start();
-    if (flag === 'debug') {
+    if (debug) {
       import('./debug.js')
         .then((m) => m.mountDebugPanel(experience))
         .catch((error) => console.warn('[universe] debug panel unavailable', error));
