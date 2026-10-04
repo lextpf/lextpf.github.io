@@ -374,8 +374,9 @@ export class PostProcessing {
      prewarm never drew it, so it compiled on the first visible frame).
 
      Then one pass of each, results thrown away: pipeline setup and the first
-     upload of the bound slots' buffers happen here, not on a visible frame. */
-  async prewarm(sceneRoot, camera) {
+     upload of the bound slots' buffers happen here, not on a visible frame,
+     unless `cancelled()` says the experience was given up while it compiled. */
+  async prewarm(sceneRoot, camera, cancelled) {
     const renderer = this.renderer;
     const pending = [renderer.compileAsync(sceneRoot, camera)];
     const passes = [this.bright, this.down, this.blur, this.composite];
@@ -386,6 +387,7 @@ export class PostProcessing {
       pending.push(renderer.compileAsync(this.scene, this.camera));
     }
     await Promise.all(pending);
+    if (cancelled && cancelled()) return;
 
     renderer.setRenderTarget(this.rtScene);
     renderer.render(sceneRoot, camera);
