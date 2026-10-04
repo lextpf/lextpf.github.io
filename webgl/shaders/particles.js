@@ -185,6 +185,39 @@ const EJECT_CONSTS = `const float EJECT_START = ${glslFloat(OUTFLOW.ejectStart)}
        once. uStaggerSpan is how wide that wave is. Inside its own window a
        structure particle leads and a dust particle follows by 0.12 (md), both
        smoothstep eased, so there is no velocity step at departure or arrival.
+    1b. Erosion, while the departing chapter asks for it (uErode.x: the
+       portrait's `erode`, chapters.js; the shape is lib/modes.js ERODE). The
+       seed timing above is replaced by a front that crosses the departing
+       formation from right to left in the first uErode.w of the morph. It
+       sets off on the first pixel of scroll from every row's own right edge
+       (uErodeRow, one per uErodeRowY.y of height from uErodeRowY.x) and
+       gathers pace as it goes, so the whole right contour starts to crumble
+       at once, slowly. Where it reaches a point is its distance in from its
+       row's right edge over the formation's width (uErode.z; rows and width
+       measured by particle-system.js), moved by a domain-warped noise field
+       on the face's plane (uErodeB.x of the width, uErodeB.y per unit), so
+       the edge is ragged, has tongues and keeps its shape as it travels; by
+       islands that hold on a little longer and pits that go a little early;
+       and barely by the seed (uErodeB.z). There a point loosens over
+       uErodeB.w of the morph: it trembles with the patch round it (uErodeD.y
+       units), lifts toward the camera (uErodeD.x) and catches a little light
+       (uErodeF.z). Then it is pulled away to the right (uErodeC.z) and
+       carried on to its own place in B, on a cubic through a waypoint
+       uErodeF.x of the way from A's centre to B's. There the stream keeps
+       uErodeF.y of the face's layout and is spread by a field of the face's
+       place, so neighbours travel together and the face leaves in strands
+       rather than as a spray. Across the path a field of the stream's own
+       place bends it (uErodeC.w): whatever passes the same spot swirls the
+       same way. In flight a point is a little dimmer (uErodeF.w) and never
+       faded out. B condenses in an order of its own, left to right and a
+       little top to bottom over its box (uErodeE), between uErodeD.z and
+       uErodeD.w of the morph, but no flight is shorter than uErodeC.x or
+       longer than uErodeC.y. B's dark points take the same flight and shrink
+       away as they land. Ahead of the front nothing moves, so the silhouette
+       holds until the front reaches it, and a point that is the same in both
+       formations (the shared sky) does not move at all. All of it is a
+       function of uMorph, so scrolling back plays it backward, and the morph
+       streak is the path's own derivative.
     2. Early out. Particles that are invisible at both ends (the registry's
        filler) are pushed off-screen at zero size and cost nothing further.
     3. shape() on both endpoints, animating each formation by its own MODE and
@@ -425,6 +458,14 @@ const EJECT_CONSTS = `const float EJECT_START = ${glslFloat(OUTFLOW.ejectStart)}
                          pattern, which swirls rather than dilating and so moves
                          dust without thinning or bunching it
      touchStir           the pointer's stir: a fast swirl round each particle's place
+     erodeHash,          the erosion (step 1b): hashes without sine (exact on
+     erodeHash3,         every GPU); value noise on them, in 2D and as a 3D
+     erodeValue,         vector field (-1 to 1); three octaves of the 2D one;
+     erodeNoise3,        the departing formation's right edge at a height;
+     erodeEdge,          the share of the morph at which the front reaches a
+     erodeRight,         point; and where a point stands in the order B
+     erodeDepart,        condenses in
+     erodeOrder
 
    --- The seventh cut (lib/modes.js HOLE_FX in uFx: doppler, frozen, corkscrew,
        each 0 or 1; at 0 each leaves the sixth cut as it was) ---
@@ -521,6 +562,14 @@ uniform float uOpacity;
 uniform float uVortex;
 uniform float uPinch;
 uniform float uScatter;
+uniform vec4 uErode;
+uniform vec4 uErodeB;
+uniform vec4 uErodeC;
+uniform vec4 uErodeD;
+uniform vec4 uErodeE;
+uniform vec4 uErodeF;
+uniform float uErodeRow[24];
+uniform vec2 uErodeRowY;
 uniform float uHand;
 uniform vec2 uViewport;
 uniform vec3 uTouchA;
@@ -1194,11 +1243,95 @@ vec3 touchStir(vec3 p, float seed) {
   return (swirl * 0.75 + orbit * 0.5) * STIR_REACH * along * g;
 }
 
+/* The erosion (main(), step 1b). erodeRight: the departing formation's right
+   edge at height y, between the rows' centres. erodeDepart: the share of the
+   morph at which the front reaches a point, its distance in from its row's
+   right edge moved by the warped edge noise, the islands, the pits and the
+   seed. The front stands on the edge at morph 0 and moves in slowly, then
+   gathers pace, and is over by uErode.w; the points the noise pushes out past
+   the edge spread over its first moments (a soft floor, not all at once), and
+   a sparse few by seed go a little ahead of it. erodeOrder: where a point stands in the order B condenses in,
+   0 first and 1 last. */
+float erodeHash(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+vec3 erodeHash3(vec3 p) {
+  p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+  p += dot(p, p.yxz + 33.33);
+  return fract((p.xxy + p.yxx) * p.zyx);
+}
+float erodeValue(vec2 q) {
+  vec2 c = floor(q);
+  vec2 f = q - c;
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(erodeHash(c), erodeHash(c + vec2(1.0, 0.0)), f.x),
+             mix(erodeHash(c + vec2(0.0, 1.0)), erodeHash(c + vec2(1.0, 1.0)), f.x), f.y);
+}
+vec3 erodeNoise3(vec3 q) {
+  vec3 c = floor(q);
+  vec3 f = q - c;
+  f = f * f * (3.0 - 2.0 * f);
+  vec3 a = mix(erodeHash3(c), erodeHash3(c + vec3(1.0, 0.0, 0.0)), f.x);
+  vec3 b = mix(erodeHash3(c + vec3(0.0, 1.0, 0.0)), erodeHash3(c + vec3(1.0, 1.0, 0.0)), f.x);
+  vec3 g = mix(erodeHash3(c + vec3(0.0, 0.0, 1.0)), erodeHash3(c + vec3(1.0, 0.0, 1.0)), f.x);
+  vec3 h = mix(erodeHash3(c + vec3(0.0, 1.0, 1.0)), erodeHash3(c + vec3(1.0, 1.0, 1.0)), f.x);
+  return mix(mix(a, b, f.y), mix(g, h, f.y), f.z) * 2.0 - 1.0;
+}
+float erodeEdge(vec2 q) {
+  return (0.58 * erodeValue(q) + 0.28 * erodeValue(q * 2.17 + 5.3) + 0.14 * erodeValue(q * 4.61 - 2.9)) * 2.0 - 1.0;
+}
+float erodeRight(float y) {
+  float u = clamp((y - uErodeRowY.x) / uErodeRowY.y, 0.0, 23.0);
+  int i = int(floor(u));
+  return mix(uErodeRow[i], uErodeRow[min(i + 1, 23)], u - float(i));
+}
+float erodeDepart(vec3 p, float seed) {
+  vec2 q = p.xy * uErodeB.y;
+  vec2 w = vec2(erodeEdge(q + vec2(3.7, 1.3)), erodeEdge(q + vec2(11.3, 7.1)));
+  float edge = erodeEdge(q + 0.9 * w) + 0.35 * erodeEdge(q * 3.1 + 17.0);
+  float f = (erodeRight(p.y) - p.x) / uErode.z
+    + uErodeB.x * edge
+    + 0.12 * smoothstep(0.62, 0.86, erodeValue(p.xy * 0.85 + 5.1))
+    - 0.08 * smoothstep(0.66, 0.9, erodeValue(p.xy * 1.25 + 9.4))
+    + uErodeB.z * (fract(seed * 91.37 + 0.43) * 2.0 - 1.0);
+  float fs = f > 0.3 ? f : 0.02 * log(1.0 + exp(f / 0.02));
+  float t = uErode.w * pow(clamp(fs, 0.0, 1.0), 0.65);
+  float early = smoothstep(0.955, 0.985, fract(seed * 71.13 + 0.29));
+  return mix(t, max(t * 0.65, t - 0.08), early);
+}
+float erodeOrder(vec3 p) {
+  float x = (p.x - uErodeE.x) / uErodeE.y;
+  float y = (uErodeE.z - p.y) / uErodeE.w;
+  return clamp(0.72 * x + 0.28 * y + 0.1 * erodeEdge(p.xy * 0.4 + 8.0), 0.0, 1.0);
+}
+
 void main() {
   float stagger = fract(aSeed * 317.71);
   float m = clamp((uMorph - stagger * uStaggerSpan) / max(1e-3, 1.0 - uStaggerSpan), 0.0, 1.0);
   float md = clamp((m - 0.12 * (1.0 - aRoleB)) / 0.88, 0.0, 1.0);
   float e = md * md * (3.0 - 2.0 * md);
+  // Step 1b, the erosion (see the header): a front in place of the seed.
+  bool erOn = false;
+  float erLoose = 0.0;
+  float erU = 0.0;
+  float erDur = 1.0;
+  if (uErode.x > 1e-3) {
+    e = 0.0;
+    md = 0.0;
+    if (!(all(equal(position, aPosB)) && aAttrA.x == aAttrB.x)) {
+      erOn = true;
+      float erFront = erodeDepart(position, aSeed);
+      float erGo = erFront + uErodeB.w;
+      erLoose = smoothstep(erFront, erGo, uMorph);
+      float erLand = clamp(mix(uErodeD.z, uErodeD.w, erodeOrder(aPosB)), erGo + uErodeC.x, erGo + uErodeC.y);
+      erDur = max(min(erLand, 1.0) - erGo, 1e-3);
+      erU = clamp((uMorph - erGo) / erDur, 0.0, 1.0);
+      e = smoothstep(0.25, 1.0, erU);
+      md = e;
+    }
+  }
   float size = mix(aAttrA.x, aAttrB.x, e);
   if (size < 1e-4) {
     gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
@@ -1222,7 +1355,7 @@ void main() {
      by sin(PI e) or by md, all exactly 0. So B is not evaluated at all, which
      is exact, not an approximation, and saves a shape() per particle (two
      with the shutter) and B's side of every per-mode helper. */
-  bool useB = e > 0.0;
+  bool useB = e > 0.0 || erU > 0.0;
   vec3 pa = shape(position, aAttrA.w, uModeA, uTiltA, uClockA, uPivotA);
   vec3 pb = useB ? shape(aPosB, aAttrB.w, uModeB, uTiltB, uClockB, uPivotB) : pa;
   float flight = sin(PI * e);
@@ -1250,6 +1383,39 @@ void main() {
   vec3 p = direct
     + curveSide * curve * reach * handedness
     + curveLift * corkscrew * reach * 0.10;
+  // Step 1b's path (see the header), in place of the flight above.
+  float erodeAlpha = 1.0;
+  vec3 erodeVel = vec3(0.0);
+  if (erOn && erLoose > 0.0) {
+    float erH = fract(aSeed * 29.17 + 0.53);
+    float erStray = smoothstep(0.86, 0.97, fract(aSeed * 47.53 + 0.17));
+    // Loosening: the patch trembles as one, lifts and catches the light.
+    vec3 erJig = erodeNoise3(position * 2.2 + vec3(0.0, 0.0, uTime * 0.7))
+      + 0.5 * erodeNoise3(position * 5.3 + vec3(uTime * 1.3, 0.0, 3.0));
+    vec3 erLift = (erJig * uErodeD.y + vec3(0.1 * uErode.x, 0.0, uErodeD.x * (0.55 + 0.45 * erH))) * erLoose;
+    // The flight: a cubic through a pull to the right and the stream's waypoint.
+    // Eased from rest, but off sooner than a smoothstep and settling longer.
+    float erW = pow(erU, 0.7);
+    float erE = erW * erW * (3.0 - 2.0 * erW);
+    float erDe = 4.2 * pow(max(erU, 1e-4), 0.4) * (1.0 - erW) / erDur;
+    vec3 erField = erodeNoise3(position * 0.21 + vec3(1.9, 4.2, 0.0));
+    vec3 erP1 = pa + vec3(1.0, 0.35 * erField.y, 0.45 + 0.35 * erField.z)
+      * (uErodeC.z * (0.75 + 0.35 * erField.x + 0.6 * erStray));
+    vec3 erP2 = mix(uPivotA, uPivotB, uErodeF.x) + (pa - uPivotA) * uErodeF.y
+      + erField * ((2.4 + 1.6 * erStray) * uErode.x);
+    float erI = 1.0 - erE;
+    vec3 erBase = erI * erI * erI * pa + 3.0 * erI * erI * erE * erP1
+      + 3.0 * erI * erE * erE * erP2 + erE * erE * erE * pb;
+    vec3 erDir = 3.0 * erI * erI * (erP1 - pa) + 6.0 * erI * erE * (erP2 - erP1) + 3.0 * erE * erE * (pb - erP2);
+    // Across it, a field of the stream's own place.
+    float erEnv = sin(PI * erE);
+    vec3 erC = erBase * 0.3 + vec3(0.0, uTime * 0.035, uTime * 0.02);
+    vec3 erTurb = (erodeNoise3(erC) + 0.5 * erodeNoise3(erC * 2.4 + 6.1)) * (uErodeC.w * (1.0 + 1.3 * erStray));
+    p = erBase + erTurb * erEnv + erLift * erI;
+    erodeVel = (erDir + erTurb * (PI * cos(PI * erE)) - erLift) * erDe;
+    size *= 1.0 - 0.12 * erEnv;
+    erodeAlpha = (1.0 - uErodeF.w * erEnv) * (1.0 + uErodeF.z * erLoose * (1.0 - smoothstep(0.0, 0.3, erU)));
+  }
 
   float flightArc = sin(PI * e);
   float genesisDim = 1.0;
@@ -1346,7 +1512,8 @@ void main() {
     d = mix(va * uRateA, vb * uRateB, e) * uShutter;
   }
   if (uMorphVel * uMorphShutter > 0.0 && uImage < 0.5) {
-    d += (delta + curveSide * (PI * cos(PI * e) * reach * handedness))
+    if (erOn) d += erodeVel * (uMorphVel * uMorphShutter);
+    else d += (delta + curveSide * (PI * cos(PI * e) * reach * handedness))
        * (6.0 * md * (1.0 - md) / (0.88 * max(0.05, 1.0 - uStaggerSpan))) * uMorphVel * uMorphShutter;
   }
   float L = 0.0;
@@ -1474,6 +1641,7 @@ void main() {
          * transportAlpha
          / (1.0 + coc * uDof * (2.6 + 3.0 * dust));
   vAlpha *= genesisDim;
+  vAlpha *= erodeAlpha;
   vAlpha *= energy / (6.2832 * sqrt(sg2.x * sg2.y) * 0.975);
   vAlpha *= lensGain;
   if (jetK > 0.0) vAlpha *= mix(1.0, discShade(mv0, holeC, jetAxis), jetK);
