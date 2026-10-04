@@ -7,7 +7,7 @@ import { PostProcessing } from './post-processing.js';
 import { ScrollTimeline } from './scroll-timeline.js';
 import { CameraRig } from './camera-rig.js';
 import { PointerController } from './pointer.js';
-import { PerformanceManager, TIERS, VsyncEstimator, detectTier, shouldPresent } from './performance.js';
+import { PerformanceManager, QualityTrial, TIERS, VsyncEstimator, detectTier, shouldPresent, trialRefresh } from './performance.js';
 import { clamp, clamp01, smootherstep } from './lib/random.js';
 import { AVATAR } from './lib/modes.js';
 import { BLACK_HOLE_HORIZON } from './formations/blackhole.js';
@@ -56,6 +56,10 @@ const FADE_TIME = 1.6;
 const FADE_TIME_REDUCED = 0.9;
 const PRIME_HOLD_MS = 1200;
 
+// On trial the landing pair is judged mid-morph: at rest the shader never
+// evaluates formation B, and the first scroll does.
+const TRIAL_MORPH = 0.5;
+
 class WebGLExperience {
   constructor(canvas, options) {
     this.canvas = canvas;
@@ -71,7 +75,8 @@ class WebGLExperience {
        shaping in the fragment shader, and nothing here is ever occluded.
        preserveDrawingBuffer only under ?universe=debug, since it forces the
        driver to keep the frame around after present and costs real bandwidth,
-       but without it a screenshot comes back blank. */
+       but without it a screenshot comes back blank. On trial the context also
+       refuses a software fallback, as the head probe's did. */
     this.renderer = new THREE.WebGLRenderer({
       canvas,
       alpha: true,
@@ -79,6 +84,7 @@ class WebGLExperience {
       depth: false,
       stencil: false,
       powerPreference: 'high-performance',
+      failIfMajorPerformanceCaveat: options.trial === true,
       preserveDrawingBuffer: options.debug === true,
     });
     this.renderer.setClearColor(0x000000, 0);
@@ -89,10 +95,16 @@ class WebGLExperience {
     // so three must not multiply it by a ratio of its own.
     this.renderer.setPixelRatio(1);
 
-    // Reduced motion skips hardware detection entirely and takes 'low': the
-    // point is a calm page, and there is no reason to spend a high tier on it.
+    /* Behind the page's loader (the head probe's gate) the universe has to earn
+       its place: it runs the high rung on trial (performance.js QualityTrial) and
+       stays only if the machine holds it. Reduced motion is tried the same way
+       and then takes its calm 'low' (endTrial). Without the gate (?universe=on,
+       the lab pages) the old guess stands: reduced motion takes 'low', everything
+       else what detectTier makes of the hardware. */
     const gl = this.renderer.getContext();
-    this.tier = this.reduced ? 'low' : detectTier(gl);
+    this.trial = options.trial ? new QualityTrial() : null;
+    this.verdict = null;
+    this.tier = this.trial ? 'high' : this.reduced ? 'low' : detectTier(gl);
     const settings = TIERS[this.tier];
 
     this.registry = new FormationRegistry(settings.count);
@@ -169,6 +181,10 @@ class WebGLExperience {
     // been seen, which makes shouldPresent a no-op.
     this.vsyncClock = new VsyncEstimator();
     this.vsync = Infinity;
+    // On trial the estimator also reads the bare callbacks while the programs
+    // compile, and the period it holds when the loop starts is kept (idleVsync):
+    // the panel's refresh, before the trial's load can thin the callbacks out.
+    this.idleVsync = Infinity;
     this.lastQualityLog = 0;
     this.fade = 0;
     // Seconds since the entrance began; only advances while fade < 1, so a
@@ -224,7 +240,16 @@ class WebGLExperience {
        until the entrance has drawn something (.is-ready), so the wait never
        shows. A failure here is the same failure a throwing constructor would
        be, and takes the same exit. */
-    this.post.prewarm(this.scene, this.rig.camera).then(
+    this._prewarm = this.post.prewarm(this.scene, this.rig.camera, () => this.disposed);
+    if (this.trial) {
+      const idle = (now) => {
+        if (this.disposed || this.running) return;
+        this.vsyncClock.sample(now);
+        requestAnimationFrame(idle);
+      };
+      requestAnimationFrame(idle);
+    }
+    this._prewarm.then(
       () => {
         if (this.disposed) return;
         this.ready = true;
@@ -247,8 +272,11 @@ class WebGLExperience {
     this._onResize = () => {
       if (!this.exactBox) this.resize();
     };
+    // A hidden tab stops the callbacks; the first frame back spans the pause,
+    // which the trial must not judge (hiddenGap).
     this._onVisibility = () => {
-      if (!document.hidden) this.start();
+      if (document.hidden) this.hiddenGap = true;
+      else this.start();
     };
     // A lost context is unrecoverable here: every buffer, texture and compiled
     // program is gone. preventDefault is what tells the browser we are handling
@@ -647,22 +675,36 @@ class WebGLExperience {
        short (capSpan), and its period is held under 17.5 ms and the recent
        gaps' lower decile (capPeriod). */
     const dtMs = this.lastNow ? now - this.lastNow : 16.7;
+    // The first frame after a (re)start has no real delta, only that stand-in,
+    // and the first after a hidden stretch spans the pause.
+    const measured = this.lastNow > 0 && !this.hiddenGap;
 
     // The 60fps cap, and deliberately the first thing after the timing bookkeeping:
     // a capped frame returns here having done essentially no work.
     if (this.lastNow && !shouldPresent(this.vsyncClock.capSpan(this.lastNow, now), this.vsyncClock.capPeriod)) return;
     const stepMs = this.lastNow ? this.vsyncClock.span(this.lastNow, now) : dtMs;
     this.lastNow = now;
+    this.hiddenGap = false;
 
     // Clamped hard at 50ms. A backgrounded tab, a debugger pause or a long GC
     // would otherwise hand every integrator below one enormous step and fling
     // the camera across the scene.
     const dt = clamp(stepMs / 1000, 0.001, 0.05);
-    // The sampler judges the machine on the raw time between presents.
+    // The sampler judges the machine on the raw time between presents. vsync
+    // goes with it: the ladder judges against the cadence the cap can actually
+    // produce on this panel, which only the refresh period reveals. On trial the
+    // gate's judge takes the frames instead, and only once every formation is
+    // baked (a bake is a long frame that says nothing about the GPU) and a
+    // version is chosen (behind the chooser the canvas is not even laid out).
+    // After a passed trial the ladder also waits out the entrance: the page's
+    // reveal lands in those frames, and the trial has just judged the machine.
+    let verdict = null;
     if (this.settle > 0) this.settle--;
-    // vsync goes with it: the ladder judges against the cadence the cap can
-    // actually produce on this panel, which only the refresh period reveals.
-    else this.perf.sample(dtMs, now, this.vsync);
+    else if (!this.trial) {
+      if (!this.verdict || this.fade >= 1) this.perf.sample(dtMs, now, this.vsync);
+    }
+    else if (!this.primed || !this.root.hasAttribute('data-cv-variant')) this.settle = 10;
+    else if (measured) verdict = this.trial.sample(dtMs, now, trialRefresh(this.vsync, this.idleVsync));
 
     // The quality heartbeat. Distinct from the "quality ->" line applyTier logs
     // on a rung change: this one keeps reporting once the ladder has converged
@@ -697,6 +739,7 @@ class WebGLExperience {
     // individual knobs to slider values, `review` pins a single formation so it
     // can be inspected without scrolling to its chapter.
     if (this.overrides) Object.assign(state, this.overrides);
+    if (this.trial && state.sceneA !== state.sceneB) state.morph = TRIAL_MORPH;
     if (this.review && this.review.scene) {
       state.sceneA = this.review.scene;
       state.sceneB = this.review.scene;
@@ -715,7 +758,7 @@ class WebGLExperience {
        and the rig still update, harmlessly, since the reduced score has no hold
        push, yaw or parallax. The first scroll or anything marked dirty draws
        again at full rate. */
-    const still = this.reduced && this.isStill(live);
+    const still = this.reduced && !this.trial && this.isStill(live);
     this.frozen = still;
     if (!still) this.elapsed += dt;
     // The camera shutter measures motion between drawn frames; a kept frame
@@ -777,7 +820,12 @@ class WebGLExperience {
        multiplies in beside it, into the particles and into presence, so the
        horizon disc dips with them. Combined here with the chapter's own opacity
        and the density compensation, in one uniform write. */
-    if (this.fade < 1) {
+    if (this.trial) {
+      // On trial the picture is drawn whole: at the entrance's low opacities the
+      // vertex shader culls points, and those frames would flatter the GPU. The
+      // loader covers it; the entrance plays from the dark once it has passed.
+      this.fade = 1;
+    } else if (this.fade < 1) {
       const beat = this.reduced ? 0 : FADE_BEAT;
       this.fadeT += dt;
       if (!this.primed && now - this.bootAt < PRIME_HOLD_MS) this.fadeT = Math.min(this.fadeT, beat);
@@ -803,6 +851,48 @@ class WebGLExperience {
       this.portrait.lit = true;
       this.heroEl.dataset.avatar = 'lit';
     }
+    // Last, so a failed trial's dispose() is the end of this frame.
+    if (verdict) this.endTrial(verdict === 'pass', now);
+  }
+
+  /* The gate's verdict on the trial. A pass keeps the universe: the ladder takes
+     over from the rung just proved (reduced motion drops to its calm 'low'), the
+     entrance plays from the dark, and the loader lifts. A fail hands the page to
+     the fallback through the same exit as any other failure. Logged in the
+     quality heartbeat's terms, so the console says why. */
+  endTrial(pass, now) {
+    const s = this.trial.stats;
+    this.trial = null;
+    this.verdict = { pass, p50: s.p50, p90: s.p90, budget: s.budget, frames: s.frames };
+    console.info(
+      `[universe] trial ${pass ? 'passed' : 'failed'}: high · ${TIERS.high.count} particles · ` +
+      `p50 ${s.p50.toFixed(1)}ms · p90 ${s.p90.toFixed(1)}ms · budget ${s.budget.toFixed(1)}ms · ${s.frames} frames`
+    );
+    if (!pass) {
+      if (this.onFail) this.onFail();
+      else {
+        this.dispose();
+        handOverToFallback();
+      }
+      return;
+    }
+    if (this.reduced) {
+      this.perf = new PerformanceManager('low', (tier, stats) => this.applyTier(tier, stats));
+      this.applyTier('low');
+    }
+    this.settle = Math.max(this.settle, 12);
+    this.fade = 0;
+    this.fadeT = 0;
+    this.bootAt = now;
+    this.dirty = true;
+    this.post.historyValid = false;
+    this.post.invalidateMotion();
+    // The canvas still holds the trial's full-strength picture, and the loader
+    // is about to fade off it: draw it dark first.
+    this.particles.setOpacity(0);
+    this.state.presence = 0;
+    this.render();
+    releaseGate();
   }
 
   /* Reduced motion only: is there nothing left to draw? The scroll has not
@@ -911,6 +1001,7 @@ class WebGLExperience {
     this.startWanted = false;
     this.running = true;
     this.lastNow = 0;
+    if (this.trial && !Number.isFinite(this.idleVsync)) this.idleVsync = this.vsyncClock.period;
     this.vsyncClock.restart();
     this.dirty = true;
     // Whatever the camera did while the loop was stopped, the first frame back
@@ -939,6 +1030,7 @@ class WebGLExperience {
   dispose() {
     this.stop();
     this.disposed = true;
+    this.trial = null;
     removeEventListener('resize', this._onResize);
     removeEventListener('orientationchange', this._onResize);
     removeEventListener('pageshow', this._onVisibility);
@@ -950,11 +1042,19 @@ class WebGLExperience {
     this.stagePortrait(false);
     this.timeline.dispose();
     this.pointer.dispose();
-    this.particles.dispose();
-    this.post.dispose();
     this.rig.dispose();
     this.registry.dispose();
-    this.renderer.dispose();
+    /* The GPU side. three's compileAsync polls the programs the prewarm is
+       compiling and throws if they are released under it, so while it is in
+       flight (the loader gave up during a slow compile) the release waits for
+       it to settle. One that never settles keeps them; the canvas is hidden. */
+    const release = () => {
+      this.particles.dispose();
+      this.post.dispose();
+      this.renderer.dispose();
+    };
+    if (this.ready || !this._prewarm) release();
+    else this._prewarm.then(release, release);
     this.loudTargets.forEach((el) => el.style.removeProperty('--cv-loud'));
     delete this.root.dataset.universeChapter;
     delete this.root.dataset.universeTier;
@@ -970,17 +1070,33 @@ const schedule =
     ? (fn) => requestIdleCallback(fn, { timeout: 1200 })
     : (fn) => setTimeout(fn, 60);
 
-/* The single exit. No WebGL, context lost, or construction threw: everything
-   ends here, swaps the html classes the CSS keys off, and starts the DOM
-   particle background that the source HTML left dormant.
+/* The single exit. No WebGL, a failed trial, context lost, or construction
+   threw: everything ends here, swaps the html classes the CSS keys off (the
+   photo comes back with cv-universe-off), starts the DOM particle background
+   that the source HTML left dormant, and lifts the loader.
 
-   Safe to call more than once. Both class operations are idempotent, and the
-   fallback's own boot() guards against double-starting. */
+   Safe to call more than once. The class operations are idempotent, the
+   fallback's own boot() guards against double-starting, and so does the gate. */
 function handOverToFallback() {
   document.documentElement.classList.remove('cv-universe-on');
   document.documentElement.classList.add('cv-universe-off');
   const dom = window.__cvBackgroundParticles;
   if (dom && typeof dom.boot === 'function') dom.boot();
+  releaseGate();
+}
+
+/* The page's quality gate (the head probe in the source HTML): while it is
+   pending the CV waits behind its loader, input held, for the universe's
+   verdict. Lifting it reveals the page (body.is-loaded waits on it). */
+function gatePending() {
+  const gate = window.__cvUniverseGate;
+  return !!(gate && gate.pending);
+}
+
+function releaseGate() {
+  document.documentElement.classList.remove('cv-universe-pending');
+  const gate = window.__cvUniverseGate;
+  if (gate && typeof gate.settle === 'function') gate.settle();
 }
 
 // Cheapest possible probe: creating a context on a throwaway canvas. Some
@@ -1025,6 +1141,9 @@ function enable() {
     const created = new WebGLExperience(canvas, {
       reduced,
       debug: flag === 'debug',
+      // On trial only while the page waits behind its loader; a console
+      // enable() after the verdict runs as it always did.
+      trial: gatePending(),
       // A failure after construction (the asynchronous prewarm) takes the same
       // exit as a thrown constructor, unless the console has moved on.
       onFail: () => {
@@ -1059,19 +1178,26 @@ function disable() {
 }
 
 function boot() {
-  if (!canvas) return;
-  if (!supportsWebGL()) {
+  if (!canvas) {
     handOverToFallback();
     return;
   }
-
-  const on = flag !== 'off';
-  if (on) enable();
-  else handOverToFallback();
+  // The head probe has the last word where it ran: no WebGL2, a software
+  // renderer, ?universe=off, or a loader that gave up waiting.
+  if (window.__cvUniverseWillRender === false || !supportsWebGL()) {
+    handOverToFallback();
+  } else if (flag !== 'off') {
+    enable();
+  } else {
+    handOverToFallback();
+  }
 
   // The console handle. Getters rather than values so it keeps reporting the
   // live experience across enable/disable cycles instead of a stale snapshot.
   window.__cvUniverse = {
+    // Tells the head probe this module settles its gate (an older one would
+    // leave the loader up until it gave up).
+    gated: true,
     get enabled() {
       return enabled;
     },
@@ -1092,8 +1218,12 @@ function boot() {
    Deliberately last in the queue. The CV's own fonts, images and layout matter
    more than the background does, and compiling shaders while they are still
    landing delays the thing the visitor actually came for. The readyState check
-   covers the module arriving after 'load' has already fired. */
-if (document.readyState === 'complete') schedule(boot);
+   covers the module arriving after 'load' has already fired.
+
+   Behind the gate's loader nothing of the CV is on screen yet and the visitor is
+   waiting on the universe itself, so there it boots at the first idle moment. */
+if (gatePending()) schedule(boot);
+else if (document.readyState === 'complete') schedule(boot);
 else addEventListener('load', () => schedule(boot), { once: true });
 
 export { WebGLExperience };
