@@ -1,14 +1,15 @@
 
 import * as THREE from './lib/three.js';
-import { CHAPTERS, REDUCED_CHAPTERS, DEFAULTS } from './chapters.js';
+import { CHAPTERS, REDUCED_CHAPTERS, DEFAULTS, PORTRAIT_VARIANTS } from './chapters.js';
 import { FormationRegistry } from './formation-registry.js';
 import { ParticleSystem } from './particle-system.js';
 import { PostProcessing } from './post-processing.js';
 import { ScrollTimeline } from './scroll-timeline.js';
 import { CameraRig } from './camera-rig.js';
 import { PointerController } from './pointer.js';
-import { PerformanceManager, TIERS, detectTier, shouldPresent } from './performance.js';
-import { clamp, clamp01, damp } from './lib/random.js';
+import { PerformanceManager, TIERS, VsyncEstimator, detectTier, shouldPresent } from './performance.js';
+import { clamp, clamp01, smootherstep } from './lib/random.js';
+import { AVATAR } from './lib/modes.js';
 import { BLACK_HOLE_HORIZON } from './formations/blackhole.js';
 
 const HORIZON_WORLD_RADIUS = BLACK_HOLE_HORIZON;
@@ -22,6 +23,11 @@ const DENSITY_REFERENCE = 100000;
 // 4K panel does not render the universe as a dusting of single pixels.
 const SIZE_REFERENCE_HEIGHT = 1080;
 
+// The CSS root size at which the page's design pixel (--dpx on the source :root)
+// is exactly 1px: the 250% zoom reference. Above it the whole page grows with the
+// root, so particle sizes and the scroll-speed scale grow with it too.
+const DESIGN_ROOT = 17.7;
+
 /* A legibility trim on top of the authored sizes, so formations read as geometry
    rather than as haze. Applied post-blend beside the density compensation, which
    makes it the one place that reaches every chapter of both scores, every tier and
@@ -32,16 +38,32 @@ const SIZE_REFERENCE_HEIGHT = 1080;
    weakest tier through a ceiling its author set deliberately. Below, sprites are
    additive with no area normalisation, so a k times size is a k squared light lift
    - measured on frozen frames, 1.08 buys 4-7% more pixels carrying structure for
-   1-3% more mean brightness, with clipping flat to four decimals. */
+   1-3% more mean brightness, with clipping flat to four decimals.
+
+   Since the point model (shaders/particles.js) a particle's size is its energy
+   and every particle is a crisp dot, so this trim is now a 1.166x light lift on
+   the dots rather than a wider sprite; the pixel counts above were measured on
+   the old size-as-blur sprites. */
 const SIZE_TRIM = 1.08;
 
 const QUALITY_LOG_MS = 2000;
+
+// The entrance: a dark beat, then the fade proper (reduced motion: no beat,
+// 0.9 s). The fade waits at the end of the beat until every formation is
+// baked, or PRIME_HOLD_MS after the first frame, whichever comes first.
+const FADE_BEAT = 0.35;
+const FADE_TIME = 1.6;
+const FADE_TIME_REDUCED = 0.9;
+const PRIME_HOLD_MS = 1200;
 
 class WebGLExperience {
   constructor(canvas, options) {
     this.canvas = canvas;
     this.reduced = options.reduced;
     this.debugRequested = options.debug;
+    // The boot's exit if something fails after construction has returned (the
+    // asynchronous prewarm). The module passes disable(); see enable().
+    this.onFail = options.onFail || null;
     this.root = document.documentElement;
 
     /* alpha, because the canvas sits behind the CV and the page background has
@@ -63,6 +85,9 @@ class WebGLExperience {
     // Linear, not sRGB. Post-processing does its own grading and tone handling,
     // so three must not apply a conversion on the way out as well.
     this.renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+    // Every size handed to the renderer is already in device pixels (resize),
+    // so three must not multiply it by a ratio of its own.
+    this.renderer.setPixelRatio(1);
 
     // Reduced motion skips hardware detection entirely and takes 'low': the
     // point is a calm page, and there is no reason to spend a high tier on it.
@@ -75,15 +100,37 @@ class WebGLExperience {
     this.post = new PostProcessing(this.renderer, {
       bloomLevels: this.reduced ? 2 : settings.bloomLevels,
       trails: this.reduced ? false : settings.trails,
+      // No camera shutter under reduced motion: like the trails it smears the
+      // picture along its motion, and the reduced page is meant to be calm. A
+      // reduced flight is drawn as sharp frames.
+      shutter: !this.reduced,
+      edgeLens: !this.reduced,
       superSample: settings.superSample,
       master: 0.74,
     });
     this.rig = new CameraRig(1);
     this.pointer = new PointerController(this.reduced ? 0 : settings.parallax);
-    this.timeline = new ScrollTimeline(this.reduced ? REDUCED_CHAPTERS : CHAPTERS);
+    this.timeline = this.reduced
+      ? new ScrollTimeline(REDUCED_CHAPTERS, { ignition: [0.35, 0.9] })
+      : new ScrollTimeline(CHAPTERS);
+    // The hero's portrait (chapters.js PORTRAIT_VARIANTS), staged before the
+    // first sample so the formations baked at boot are the ones on screen.
+    this.heroEl = document.getElementById('hero');
+    this.portrait = null;
+    this.stagePortrait();
+    // The variant chooser can set the variant after boot.
+    this._variantObserver = typeof MutationObserver === 'function'
+      ? new MutationObserver(() => {
+        if (this.disposed) return;
+        this.stagePortrait();
+        this.fitPortrait();
+        this.dirty = true;
+      })
+      : null;
+    if (this._variantObserver) this._variantObserver.observe(this.root, { attributes: true, attributeFilter: ['data-cv-variant'] });
 
     this.scene = new THREE.Scene();
-    this.scene.add(this.particles.points);
+    this.scene.add(this.particles.points, this.particles.mirror);
 
     this.perf = new PerformanceManager(this.tier, (tier, stats) => this.applyTier(tier, stats));
     // Where the black hole lands on screen and how big it is, recomputed each
@@ -96,25 +143,54 @@ class WebGLExperience {
     );
 
     this.state = { ...DEFAULTS };
+    // root / DESIGN_ROOT, at least 1; measured in resize().
+    this.designScale = 1;
+    // How present the universe is overall (the boot fade), for the composite's
+    // horizon: the disc is painted in 2D, not by particles, so particle opacity
+    // alone would leave a full-strength disc over a half-faded field.
+    this.state.presence = 0;
     this.overrides = null;
     this.review = null;
+    // The effective device-pixel ratio of the canvas buffer (buffer width over
+    // CSS width), not a cap: the buffer is always the canvas's native box.
     this.dpr = 1;
-    this.dprCap = settings.dpr;
-    this.heightCap = settings.maxHeight;
+    this.bufferWidth = 0;
+    this.bufferHeight = 0;
+    // The last box the ResizeObserver reported (see observeCanvas), used while
+    // it still describes the canvas's CSS size.
+    this.box = null;
     this.superSample = settings.superSample;
     this.densityAlpha = 1;
     this.densitySize = 1;
     this.elapsed = 0;
     this.lastNow = 0;
-    this.lastRaf = 0;
-    // Estimated refresh period, measured rather than assumed. Infinity until the
-    // first two frames have been seen, which makes shouldPresent a no-op.
+    // The refresh period, measured rather than assumed, and the frame clock
+    // snapped to it (performance.js). vsync is Infinity until two rAF gaps have
+    // been seen, which makes shouldPresent a no-op.
+    this.vsyncClock = new VsyncEstimator();
     this.vsync = Infinity;
-    this.vsyncSince = 0;
     this.lastQualityLog = 0;
     this.fade = 0;
-    this.staticAccum = 0;
+    // Seconds since the entrance began; only advances while fade < 1, so a
+    // harness that pins fade = 1 keeps it there.
+    this.fadeT = 0;
+    // Timestamp of the first frame; the entrance's wait for priming counts
+    // from it.
+    this.bootAt = 0;
+    // Every formation of this timeline baked (primeRemaining).
+    this.primed = false;
+    // Reduced motion: this frame kept the last picture instead of drawing.
+    // Anything that carries history between frames must treat the next drawn
+    // frame as a cut.
+    this.frozen = false;
+    // Something changed that a still reduced frame has to draw anyway: a new
+    // rung, a restart.
+    this.dirty = true;
     this.lastScrollY = -1;
+    // The programs compile asynchronously (prewarm below). Until they have,
+    // start() only records that it was asked.
+    this.ready = false;
+    this.startWanted = false;
     // Last values pushed to the DOM. Kept so syncDom can skip writes that would
     // not change anything.
     this.lastLoud = -1;
@@ -137,11 +213,40 @@ class WebGLExperience {
     this.particles.setPair(first.sceneA, first.sceneB);
     for (const key in first) this.state[key] = first[key];
 
+    // Sizes the canvas synchronously (resize); the observer then refines it
+    // to the exact device-pixel box.
     this.applyTier(this.tier);
-    this.resize();
-    this.post.prewarm(this.scene, this.rig.camera);
+    this.observeCanvas();
 
-    this._onResize = () => this.resize();
+    /* A quiet boot. The programs compile off the main thread where the driver
+       allows it and the loop starts only once they are ready, so the first
+       frames do not stall on a shader compile. The canvas stays invisible
+       until the entrance has drawn something (.is-ready), so the wait never
+       shows. A failure here is the same failure a throwing constructor would
+       be, and takes the same exit. */
+    this.post.prewarm(this.scene, this.rig.camera).then(
+      () => {
+        if (this.disposed) return;
+        this.ready = true;
+        if (this.startWanted) this.start();
+      },
+      (error) => {
+        if (this.disposed) return;
+        console.warn('[universe] initialisation failed, falling back', error);
+        if (this.onFail) this.onFail();
+        else {
+          this.dispose();
+          handOverToFallback();
+        }
+      },
+    );
+
+    // A window resize is the observer's to handle wherever it can report
+    // device pixels; elsewhere this is the only resize signal for a change of
+    // devicePixelRatio that leaves the CSS box alone.
+    this._onResize = () => {
+      if (!this.exactBox) this.resize();
+    };
     this._onVisibility = () => {
       if (!document.hidden) this.start();
     };
@@ -160,29 +265,92 @@ class WebGLExperience {
     document.addEventListener('visibilitychange', this._onVisibility);
     canvas.addEventListener('webglcontextlost', this._onContextLost);
 
-    this.primeRemaining();
+    this.primeRemaining(first.settledIndex);
   }
 
-  /* Bake every remaining formation during idle time, one per callback.
+  /* Bake every remaining formation during idle time, one per callback, nearest
+     chapter first.
 
-     Baking is a few tens of milliseconds each. Doing them all at once would
-     block the main thread through the first second of the page; doing them
-     lazily on arrival would stall a scroll. One at a time on idle callbacks
-     spreads the cost across the period the visitor is still reading the hero,
-     and by the time they scroll the cache is warm.
+     Baking is 20-130 ms each. Doing them all at once would block the main
+     thread through the first second of the page; doing them lazily on arrival
+     would stall a scroll. Back to back on idle callbacks they are done in
+     about half a second on the owner's machine, while the entrance is still
+     dark: the fade waits for `primed` (see frame), so none of these stalls
+     lands in it.
+     Nearest first, so a visitor who scrolls at once meets baked formations in
+     the order they will need them.
 
      Yielding between each is what makes it interruptible: a callback that
      arrives after dispose() simply stops the chain. */
-  primeRemaining() {
-    const queue = [...new Set(this.timeline.scenes)];
+  primeRemaining(here = 0) {
+    const distance = new Map();
+    this.timeline.chapters.forEach((chapter, i) => {
+      const d = Math.abs(i - here);
+      if (!(distance.get(chapter.scene) <= d)) distance.set(chapter.scene, d);
+    });
+    const queue = [...distance.keys()]
+      .filter((id) => !this.registry.cache.has(id))
+      .sort((a, b) => distance.get(a) - distance.get(b));
     const step = () => {
       if (this.disposed) return;
       const id = queue.shift();
-      if (!id) return;
+      if (!id) {
+        this.primed = true;
+        return;
+      }
       this.registry.get(id);
       schedule(step);
     };
-    schedule(step);
+    if (queue.length) schedule(step);
+    else this.primed = true;
+  }
+
+  /* Size the canvas to the device pixels it actually covers.
+
+     The buffer used to be floor(CSS size x a capped ratio). At a fractional
+     devicePixelRatio that lands a fraction of a pixel off the box the
+     compositor draws the canvas into, and the compositor resamples the whole
+     frame to fit: measured on a 1-px checkerboard at real device ratios, 49%
+     of single-pixel contrast survived at 1.25 and on a 4K panel at 150%, 24%
+     at 2 (the old 1.75 cap). A ResizeObserver on the
+     'device-pixel-content-box' reports the exact integer box instead, and a
+     buffer of exactly that size is composited 1:1 at every ratio. Safari has
+     no such box; there the content box times devicePixelRatio, rounded, is
+     the best estimate, and the window's resize event stays wired (a change of
+     ratio alone moves no CSS box). */
+  observeCanvas() {
+    this.exactBox = false;
+    if (typeof ResizeObserver !== 'function') return;
+    this._boxObserver = new ResizeObserver((entries) => this.onCanvasBox(entries[entries.length - 1]));
+    try {
+      this._boxObserver.observe(this.canvas, { box: 'device-pixel-content-box' });
+      this.exactBox = true;
+    } catch (_) {
+      this._boxObserver.observe(this.canvas);
+    }
+  }
+
+  /* A device box is the CSS box times the ratio with its edges snapped to
+     whole pixels, so it can differ from that product by at most a pixel. One
+     that differs by more is not describing this canvas at this ratio: under
+     device emulation (DevTools' device mode, Playwright's deviceScaleFactor)
+     Chrome reports the box at the window's real ratio while devicePixelRatio
+     and the rendering follow the emulated one. The rounded product is right
+     there, to within that same pixel. */
+  onCanvasBox(entry) {
+    if (this.disposed || !entry) return;
+    const rect = entry.contentRect;
+    const ratio = devicePixelRatio || 1;
+    const wantW = rect.width * ratio;
+    const wantH = rect.height * ratio;
+    const exact = entry.devicePixelContentBoxSize && entry.devicePixelContentBoxSize[0];
+    const trusted = exact && Math.abs(exact.inlineSize - wantW) <= 1 && Math.abs(exact.blockSize - wantH) <= 1;
+    const w = trusted ? exact.inlineSize : Math.round(wantW);
+    const h = trusted ? exact.blockSize : Math.round(wantH);
+    // A hidden canvas (display: none) has no box to match.
+    if (!(w > 0 && h > 0)) return;
+    this.box = { cssWidth: rect.width, cssHeight: rect.height, ratio, w, h, exact: !!trusted };
+    this.resize();
   }
 
   // Move to a quality rung. Called once at construction and thereafter by the
@@ -194,15 +362,20 @@ class WebGLExperience {
     this.post.bloomLevels = this.reduced ? 2 : settings.bloomLevels;
     this.post.trailsEnabled = this.reduced ? false : settings.trails && !!this.post.rtHistoryA;
     this.pointer.setScale(this.reduced ? 0 : settings.parallax);
-    this.dprCap = settings.dpr;
-    this.heightCap = settings.maxHeight;
     /* Fewer particles have to be brighter and bigger, or a lower tier reads as a
        dimmer, sparser page rather than the same page. Both exponents were tuned
        by eye against the reference count and both are capped, because past a
-       point compensation stops reading as density and starts reading as blur. */
+       point compensation stops reading as density and starts reading as blur.
+       densitySize reaches the particles twice: through state.size, which is
+       their energy, and through setDensity, which widens their dot footprint
+       by the same factor, so the extra light spreads the way the old enlarged
+       sprites did instead of piling into hotter points. */
     const ratio = DENSITY_REFERENCE / settings.count;
     this.densityAlpha = clamp(Math.sqrt(ratio), 1.0, 1.65);
     this.densitySize = clamp(Math.pow(ratio, 0.34), 1.0, 1.6);
+    this.particles.setDensity(this.densitySize);
+    // Brighter dots would let dust into the bloom: the threshold follows them.
+    this.post.setDensity(this.densityAlpha);
     // A root write, but only on an actual rung change (a handful of times per
     // session at most), never per frame. See syncDom for why that matters.
     this.root.dataset.universeTier = tier;
@@ -216,49 +389,82 @@ class WebGLExperience {
     // Reallocating buffers produces slow frames. Do not let the ladder judge
     // itself on the cost of its own last decision.
     this.settle = Math.max(this.settle, 12);
+    this.dirty = true;
+    // A rung is a cut for the camera shutter: the next frame draws sharp.
+    this.post.invalidateMotion();
+    // A rung never changes the resolution; this re-measures, so a harness that
+    // resizes the viewport and applies a tier reads the new frame at once.
     this.resize();
     if (stats) {
       console.info(
         `[universe] quality -> ${tier} (p95 ${stats.p95.toFixed(1)}ms, avg ${stats.avg.toFixed(1)}ms, ` +
-        `${settings.count} particles, dpr cap ${settings.dpr})`
+        `${settings.count} particles, native dpr ${this.dpr.toFixed(2)})`
       );
     }
   }
 
+  /* Size everything to the canvas's device-pixel box.
+
+     Callable at any time, synchronously: it runs at construction and whenever
+     a tier is applied, and harnesses call it directly after changing the
+     viewport. It measures the canvas's CSS box (fixed at inset 0 and 100% x
+     100%, so the layout viewport less the scrollbar, the box the CV is laid
+     out in) and uses the observer's exact device box while that box still
+     describes this CSS size at this ratio; otherwise CSS size x
+     devicePixelRatio, rounded, until the observer reports. Nothing caps the
+     result: no ratio ceiling, no height ceiling, no pixel budget. When the
+     ladder needs to buy time it cuts particles, never pixels. */
   resize() {
-    // clientWidth rather than innerWidth: it excludes the scrollbar, so the
-    // canvas matches the layout viewport the CV is laid out in.
-    const width = this.root.clientWidth || innerWidth;
-    const height = innerHeight;
-    // Three ceilings at once: what the display asks for, what the tier allows,
-    // and an absolute pixel-height cap so a very tall window cannot quietly
-    // multiply the cost of every pass in the chain.
-    const dpr = Math.min(
-      devicePixelRatio || 1,
-      this.dprCap || 1.5,
-      (this.heightCap || Infinity) / Math.max(1, height),
-    );
-    if (width !== this.cssWidth || height !== this.cssHeight || dpr !== this.dpr) {
-      this.cssWidth = width;
-      this.cssHeight = height;
-      this.dpr = dpr;
-      this.renderer.setPixelRatio(dpr);
-      this.renderer.setSize(width, height, false);
-      this.aspect = width / Math.max(1, height);
-      this.rig.setAspect(this.aspect);
-      this.narrow = width < 820;
+    const rect = this.canvas.getBoundingClientRect();
+    let cssWidth = rect.width;
+    let cssHeight = rect.height;
+    if (!(cssWidth > 0 && cssHeight > 0)) {
+      cssWidth = this.root.clientWidth || innerWidth;
+      cssHeight = innerHeight;
     }
-    this.post.setSize(Math.floor(width * this.dpr), Math.floor(height * this.dpr));
-    // post may have clamped its own scale to stay inside the pixel budget, so
-    // read renderScale back rather than assuming superSample was honoured.
-    const scale = this.dpr * this.post.renderScale;
-    const frameHeight = Math.floor(height * scale);
-    this.particles.setViewport(Math.floor(width * scale), frameHeight);
-    this.particles.setSizeScale(clamp(Math.max(this.dpr, frameHeight / SIZE_REFERENCE_HEIGHT), 1, 3));
+    const ratio = devicePixelRatio || 1;
+    const box = this.box;
+    const observed = box && box.ratio === ratio &&
+      Math.abs(box.cssWidth - cssWidth) < 0.01 && Math.abs(box.cssHeight - cssHeight) < 0.01;
+    const width = observed ? box.w : Math.max(1, Math.round(cssWidth * ratio));
+    const height = observed ? box.h : Math.max(1, Math.round(cssHeight * ratio));
+    const changed = width !== this.bufferWidth || height !== this.bufferHeight;
+    if (changed || cssWidth !== this.cssWidth || cssHeight !== this.cssHeight) {
+      this.cssWidth = cssWidth;
+      this.cssHeight = cssHeight;
+      this.dpr = width / cssWidth;
+      // Attributes only: the canvas's CSS box is the page's, never written.
+      if (changed) this.renderer.setSize(width, height, false);
+      this.bufferWidth = width;
+      this.bufferHeight = height;
+      this.aspect = width / height;
+      this.rig.setAspect(this.aspect);
+      this.narrow = cssWidth < 820;
+    }
+    this.post.setSize(width, height);
+    // The portrait's camera is fitted to the medallion at this size.
+    this.fitPortrait();
+    // The particles draw into the scene target, so that is their viewport.
+    // uSizeScale: the authored sizes were tuned on a 1080p frame at ratio 1.
+    // The buffer is always native now, so the bound is the densest real screen:
+    // ratio-4 phones, and 8K-class buffers (4320 rows).
+    const sceneWidth = this.post.rtScene.width;
+    const sceneHeight = this.post.rtScene.height;
+    this.particles.setViewport(sceneWidth, sceneHeight);
+    // A read, never a write, on <html>. At 100% on a large screen the page is the
+    // 250% view scaled by designScale; at 250% the ratio term carries the same
+    // factor, so both draw the same particles.
+    const rootPx = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+    this.designScale = Math.max(1, rootPx / DESIGN_ROOT);
+    this.particles.setSizeScale(clamp(Math.max(sceneWidth / cssWidth * this.designScale, sceneHeight / SIZE_REFERENCE_HEIGHT), 1, 4));
     // Repaint immediately instead of waiting for the next frame, so dragging a
-    // window edge does not smear a stale, wrongly-scaled image. Guarded because
-    // resize() also runs during construction, before anything is loaded.
-    if (this.particles.slots[this.particles.aIndex].id) this.render();
+    // window edge does not smear a stale, wrongly-scaled image (a new buffer
+    // starts cleared). Not before the programs are ready: a draw now would
+    // compile them synchronously, the stall the prewarm exists to avoid.
+    if (changed) {
+      this.dirty = true;
+      if (this.ready && this.particles.slots[this.particles.aIndex].id) this.render();
+    }
   }
 
   /* Re-stage the authored shot for a narrow viewport.
@@ -279,6 +485,8 @@ class WebGLExperience {
     state.camZ *= pull;
     state.camX *= 0.22;
     state.tgtX *= 0.22;
+    state.frameX *= 0.22;
+    state.holdPush *= 0.5;
     state.camY = state.camY * 0.7 + 2.2;
     state.noise *= 0.85;
     state.bloom *= 0.85;
@@ -291,9 +499,127 @@ class WebGLExperience {
     return state;
   }
 
+  /* The hero's portrait (chapters.js PORTRAIT): where the CV carries a photo
+     the hero is the avatar and contact the program under the portrait's sky.
+     Staged on the timeline's own chapter objects, which it reads every frame,
+     so the bands blend into and out of it like any authored chapter; the
+     authored values are kept and put back when the variant changes or the
+     experience is disposed. */
+  stagePortrait(allow = true) {
+    const chapters = this.timeline.chapters;
+    const hero = chapters.find((c) => c.id === 'hero');
+    const contact = chapters.find((c) => c.id === 'contact');
+    const spec = hero && hero.portrait;
+    const anchor = spec ? document.querySelector(spec.anchor) : null;
+    // The portrait's maps travel inside the document (formations/avatar.js).
+    const data = document.getElementById('cv-avatar-data');
+    const want = !!(allow && spec && contact && anchor && data && PORTRAIT_VARIANTS.includes(this.root.getAttribute('data-cv-variant')));
+    // The page hides the photo from the first paint wherever the universe
+    // runs (#cv-avatar-style); a photo this variant shows and the universe
+    // will not replace stays.
+    if (allow && !want && anchor && this.root.hasAttribute('data-cv-variant') && anchor.offsetWidth > 0) {
+      this.root.classList.add('cv-avatar-photo');
+    }
+    if (want === !!this.portrait) return;
+    if (want) {
+      const keep = { scene: hero.scene };
+      Object.keys(spec.knobs).concat(['camX', 'camY', 'camZ', 'tgtX', 'tgtY', 'tgtZ', 'frameX']).forEach((k) => {
+        keep[k] = hero[k];
+      });
+      this.portrait = { hero, contact, spec, anchor, keep, contactScene: contact.scene, lit: false };
+      Object.assign(hero, spec.knobs);
+      hero.scene = spec.scene;
+      contact.scene = spec.contactScene;
+      // Until the first fit: the frame the sky is laid for.
+      [hero.camX, hero.camY, hero.camZ] = spec.desk.cam;
+      [hero.tgtX, hero.tgtY, hero.tgtZ] = spec.desk.tgt;
+      if (typeof ResizeObserver === 'function') {
+        this._anchorObserver = new ResizeObserver(() => this.fitPortrait());
+        this._anchorObserver.observe(anchor);
+        if (this.heroEl) this._anchorObserver.observe(this.heroEl);
+      }
+      if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => this.fitPortrait());
+    } else {
+      const p = this.portrait;
+      Object.assign(p.hero, p.keep);
+      p.contact.scene = p.contactScene;
+      if (this._anchorObserver) this._anchorObserver.disconnect();
+      this._anchorObserver = null;
+      if (this.heroEl) delete this.heroEl.dataset.avatar;
+      this.portrait = null;
+    }
+    this.prefetchedFor = -1;
+    // The knobs may change the hero's band and camDelay: re-lay the bands and
+    // let the camera re-read which bands hold it.
+    this.timeline._held = null;
+    this.timeline.measureLayout();
+  }
+
+  /* Fit the hero camera so the portrait's circle (lib/modes.js AVATAR: radius
+     side / 2 about the centre) lands on the photo's circle in the medallion
+     at scroll 0: its centre on the medallion's centre, its radius on the
+     photo's. The camera looks straight down -z from in front of the portrait
+     (no oblique view of the relief); its distance sets the size, its height
+     the row, and a horizontal lens shift the column. The medallion is read through the offset chain,
+     which ignores transforms, so its entrance and scroll parallax do not move
+     the fit. On a narrow viewport reframe() moves the camera after the blend;
+     the fit stores reframe's inverse, so the hero's camera lands exactly here
+     and the band into contact blends from it like any authored camera. */
+  fitPortrait() {
+    const p = this.portrait;
+    if (!p || !(this.cssWidth > 0 && this.cssHeight > 0)) return;
+    const el = p.anchor;
+    if (!el.isConnected || !el.offsetWidth) return;
+    let x = 0;
+    let y = 0;
+    for (let e = el; e; e = e.offsetParent) {
+      x += e.offsetLeft;
+      y += e.offsetTop;
+    }
+    const rem = parseFloat(getComputedStyle(this.root).fontSize) || 16;
+    const radius = (el.offsetWidth / 2 - p.spec.inset * rem) * (p.spec.scale || 1);
+    if (!(radius > 0)) return;
+    const W = this.cssWidth;
+    const H = this.cssHeight;
+    const sx = ((x + el.offsetWidth / 2) / W) * 2 - 1;
+    const sy = 1 - ((y + el.offsetHeight / 2) / H) * 2;
+    const h = p.hero;
+    const t = Math.tan((h.fov * Math.PI) / 360);
+    const [ax, ay, az] = AVATAR.centre;
+    const D = AVATAR.side / 2 / ((radius / (H / 2)) * t);
+    // Head-on across: the camera stands in front of the portrait and a lens
+    // shift (frameX, in half-widths) carries it out to the medallion, so a
+    // medallion at the side of the frame still sees the face straight on.
+    const camY = ay - sy * D * t;
+    const camZ = az + D;
+    if (this.narrow) {
+      const pull = (this.aspect < 0.8 ? 1.34 : 1.16) * (h.narrowPull || 1);
+      h.camX = h.tgtX = ax / 0.22;
+      h.frameX = sx / 0.22;
+      h.camY = (camY - 2.2) / 0.7;
+      h.camZ = camZ / pull;
+    } else {
+      h.camX = h.tgtX = ax;
+      h.frameX = sx;
+      h.camY = camY;
+      h.camZ = camZ;
+    }
+    h.tgtY = camY;
+    h.tgtZ = az;
+    p.fit = { sx, sy, radius, D };
+    this.dirty = true;
+  }
+
+  /* The camera shutter's blur plane is the subject: the rig's distance to its
+     look-at point, not state.focus (a depth-of-field knob: contact focuses at
+     58 on a subject 46 away, projects at 48 on one at 54, opensource at 46 down
+     a tunnel it looks 65 along). The timeline's snap reaches the shutter
+     through state.snapped. */
   render() {
     this.rig.projectSphere(HORIZON_WORLD_RADIUS, this.aspect, this.focusPoint);
-    this.post.render(this.scene, this.rig.camera, this.state, this.focusPoint, this.elapsed);
+    this.post.holeFx = this.particles.holeCrescent(this.rig.camera);
+    const subject = this.rig.camera.position.distanceTo(this.rig.look);
+    this.post.render(this.scene, this.rig.camera, this.state, this.focusPoint, this.elapsed, subject);
   }
 
   frame(now) {
@@ -301,38 +627,38 @@ class WebGLExperience {
     // Re-arm first, so an exception anywhere below does not silently end the
     // animation loop for the rest of the session.
     this.raf = requestAnimationFrame(this._frame);
+    if (!this.bootAt) this.bootAt = now;
 
-    /* Estimate the display's refresh period from the gaps between rAF calls.
+    /* The display's refresh grid, from every rAF callback, capped ones included
+       (performance.js VsyncEstimator): its period, and, once the stamps lock to
+       it, the phase of its edges. */
+    this.vsync = this.vsyncClock.sample(now);
 
-       Every gap is some whole number of refreshes, so the smallest one seen is
-       the period itself. The 2 second reset stops the estimate being permanently
-       poisoned by one anomalously short gap, and lets it re-converge if the
-       window is dragged to a display running at a different rate. Gaps outside
-       0.5..100ms are timer noise or stalls, not refreshes. */
-    if (this.lastRaf) {
-      const raw = now - this.lastRaf;
-      if (raw > 0.5 && raw < 100) {
-        if (now - this.vsyncSince > 2000) {
-          this.vsync = raw;
-          this.vsyncSince = now;
-        } else {
-          this.vsync = Math.min(this.vsync, raw);
-        }
-      }
-    }
-    this.lastRaf = now;
+    /* The time since the last present, in whole refreshes. rAF timestamps are
+       only good to 0.1 ms, and Chrome stamps a callback late (never early) when
+       the page is busy, but the frame each one stands for is a whole number of
+       refreshes. Counted on the locked grid, a callback stamped late still
+       belongs to its own refresh, so the cap cannot mistake the third refresh
+       for the fourth, and a given count is the same decision every frame (on a
+       panel where 60 fps sits between two counts, 90 Hz, a raw time flips it at
+       random). The integrators step by the same exact refreshes, so a steady
+       cadence is a steady dt. Unlocked, the time is snapped to the measured
+       refresh; a stall passes through raw. The cap's count may only ever be
+       short (capSpan), and its period is held under 17.5 ms and the recent
+       gaps' lower decile (capPeriod). */
+    const dtMs = this.lastNow ? now - this.lastNow : 16.7;
 
     // The 60fps cap, and deliberately the first thing after the timing bookkeeping:
     // a capped frame returns here having done essentially no work.
-    if (this.lastNow && !shouldPresent(now - this.lastNow, this.vsync)) return;
+    if (this.lastNow && !shouldPresent(this.vsyncClock.capSpan(this.lastNow, now), this.vsyncClock.capPeriod)) return;
+    const stepMs = this.lastNow ? this.vsyncClock.span(this.lastNow, now) : dtMs;
+    this.lastNow = now;
 
     // Clamped hard at 50ms. A backgrounded tab, a debugger pause or a long GC
     // would otherwise hand every integrator below one enormous step and fling
     // the camera across the scene.
-    const dtMs = this.lastNow ? now - this.lastNow : 16.7;
-    this.lastNow = now;
-    const dt = clamp(dtMs / 1000, 0.001, 0.05);
-    this.elapsed += dt;
+    const dt = clamp(stepMs / 1000, 0.001, 0.05);
+    // The sampler judges the machine on the raw time between presents.
     if (this.settle > 0) this.settle--;
     // vsync goes with it: the ladder judges against the cadence the cap can
     // actually produce on this panel, which only the refresh period reveals.
@@ -356,9 +682,15 @@ class WebGLExperience {
     const live = this.timeline.update(dt);
     // A scroll jump produced a teleport rather than a smooth move; the frames
     // that follow are not representative of the hardware.
-    if (live.snapped) this.settle = Math.max(this.settle, 10);
+    // The trail history belongs to the chapter we just left: drop it.
+    if (live.snapped) {
+      this.settle = Math.max(this.settle, 10);
+      this.post.historyValid = false;
+    }
     const state = this.state;
     for (const key in live) state[key] = live[key];
+    // Scroll speed in design px, so the same scroll drives the effects alike at any zoom.
+    state.velocity = live.velocity / this.designScale;
     this.reframe(state);
     state.size *= this.densitySize * SIZE_TRIM;
     // Debug-panel escape hatches, both no-ops in production: `overrides` pins
@@ -370,6 +702,27 @@ class WebGLExperience {
       state.sceneB = this.review.scene;
       state.morph = 0;
     }
+
+    /* Under reduced motion, a still page is a still picture.
+
+       The reduced chapters animate only very slowly, and they used to keep
+       re-rendering at about 7 fps with every clock running, so a held picture
+       crept by 0.3-0.7 px per render. Now, once nothing is converging (the
+       scroll, the three heads, the dip, the entrance) the clocks stop, dt is 0
+       for the particles and nothing is drawn: the canvas keeps its last frame.
+       Decided after the timeline has been sampled (its heads have landed) and
+       before the elapsed clock, the particle clocks and the render; the pointer
+       and the rig still update, harmlessly, since the reduced score has no hold
+       push, yaw or parallax. The first scroll or anything marked dirty draws
+       again at full rate. */
+    const still = this.reduced && this.isStill(live);
+    this.frozen = still;
+    if (!still) this.elapsed += dt;
+    // The camera shutter measures motion between drawn frames; a kept frame
+    // breaks that chain, so the next drawn frame is sharp. The shutter is off
+    // under reduced motion, the only path that keeps frames, so this holds the
+    // rule rather than changing a picture.
+    else this.post.invalidateMotion();
 
     this.pointer.update(dt);
     this.rig.update(state, this.pointer, dt, this.elapsed);
@@ -394,7 +747,9 @@ class WebGLExperience {
       };
     }
     const tp = this._touch;
-    tp.dir.set(this.pointer.x, -this.pointer.y, 0.5)
+    // The stir's ray follows the cursor closely (pointer.hx, hy), not the
+    // parallax's slow read of it.
+    tp.dir.set(this.pointer.hx, -this.pointer.hy, 0.5)
       .unproject(this.rig.camera).sub(this.rig.camera.position).normalize();
     tp.tip.copy(tp.dir).multiplyScalar(state.focus || 55).add(this.rig.camera.position);
     // Skipped on the very first frame, where there is no previous tip and the
@@ -407,53 +762,96 @@ class WebGLExperience {
     }
     tp.last.copy(tp.tip);
     tp.has = true;
-    this.particles.setPointer(this.rig.camera.position, tp.dir, tp.smooth, clamp01(this.pointer.strength));
+    // No bloat under reduced motion (that score has no pointer effects at all).
+    this.particles.setPointer(this.rig.camera.position, tp.dir, tp.smooth, this.reduced ? 0 : clamp01(this.pointer.hover));
 
-    this.particles.update(state, dt, this.elapsed);
+    this.particles.update(state, still ? 0 : dt, this.elapsed);
 
-    // One global fade-in from black on first run, so the universe arrives rather
-    // than appearing. Combined here with the chapter's own opacity and the
-    // density compensation, in one uniform write.
-    this.fade = damp(this.fade, 1, 3.2, dt);
-    this.particles.setOpacity(clamp01(this.fade) * state.opacity * this.densityAlpha);
+    /* One global fade-in from black on first run, so the universe arrives rather
+       than appearing: a short beat for the page to settle, then 1.6 s on an
+       S-curve that lands exactly on 1 (reduced motion: 0.9 s, no beat). The
+       fade waits at the end of the beat until priming has baked every
+       remaining formation, or 1.2 s after the first frame: bakes are 20-130 ms
+       of blocking work each, and they now land while the canvas is still dark
+       instead of stuttering the entrance. The navigation dip (live.cut)
+       multiplies in beside it, into the particles and into presence, so the
+       horizon disc dips with them. Combined here with the chapter's own opacity
+       and the density compensation, in one uniform write. */
+    if (this.fade < 1) {
+      const beat = this.reduced ? 0 : FADE_BEAT;
+      this.fadeT += dt;
+      if (!this.primed && now - this.bootAt < PRIME_HOLD_MS) this.fadeT = Math.min(this.fadeT, beat);
+      this.fade = smootherstep(clamp01((this.fadeT - beat) / (this.reduced ? FADE_TIME_REDUCED : FADE_TIME)));
+    }
+    const shown = clamp01(this.fade) * live.cut;
+    this.particles.setOpacity(shown * state.opacity * this.densityAlpha);
+    state.presence = shown;
 
-    /* Under reduced motion, stop redrawing a picture that is not changing.
-
-       The reduced chapters still animate, just very slowly, so this throttles to
-       roughly 7fps while the page is still and returns to full rate the moment
-       the scroll moves. Everything above this point has already run, so the
-       state stays current; only the expensive part is skipped. */
-    if (this.reduced) {
-      this.staticAccum += dt;
-      const moved = Math.abs(scrollY - this.lastScrollY) > 1;
-      if (!moved && this.staticAccum < 0.14 && this.fade > 0.999) return;
-      this.staticAccum = 0;
+    if (!still) {
+      this.render();
+      this.dirty = false;
       this.lastScrollY = scrollY;
     }
-
-    this.render();
     this.syncDom(state);
     this.maybePrefetch(live);
     // Revealed by CSS transition once there is something to see, so the canvas
     // does not flash empty over the page background on load.
     if (this.fade > 0.02) this.canvas.classList.add('is-ready');
+    // The portrait is drawing: the probe's watchdog stands down, and a photo
+    // it had brought back cross-fades out (#cv-avatar-style). Once.
+    if (this.portrait && !this.portrait.lit && this.fade > 0.02 && this.heroEl) {
+      this.portrait.lit = true;
+      this.heroEl.dataset.avatar = 'lit';
+    }
   }
 
-  /* Warm the chapter after next into the spare slot.
+  /* Reduced motion only: is there nothing left to draw? The scroll has not
+     moved, every head sits exactly on the scroll (the timeline lands them
+     exactly, see its settle epsilon), the dip and the entrance are complete,
+     and nothing was marked dirty. The debug panel's overrides and review pins
+     always draw. */
+  isStill(live) {
+    const tl = this.timeline;
+    return !this.dirty && !this.overrides && !this.review &&
+      Math.abs(scrollY - this.lastScrollY) <= 1 &&
+      tl.pos.morph === tl.raw && tl.vel.morph === 0 &&
+      tl.pos.camera === tl.raw && tl.pos.post === tl.raw &&
+      live.cut >= 1 && this.fade >= 1;
+  }
 
-     Index + 2, not + 1: the next chapter is already bound as B. Gated on being
-     45% of the way in, by which point the direction of travel is clear, and on
-     not scrolling violently, because a fast scroll will have blown through
-     several chapters before the idle callback ever runs and would be prefetching
-     the wrong one. `prefetchedFor` keeps it to once per chapter. */
+  /* Warm the chapter after next into the spare slot, while the current one is
+     held.
+
+     settledIndex + 2, not + 1: during hold k the pair is (k, k + 1), already
+     bound. Gated on the hold, when nothing is morphing and the 3 MB upload
+     cannot land mid-transition, and on not scrolling violently, because a fast
+     scroll will have blown through several chapters before the idle callback
+     ever runs and would be prefetching the wrong one. The hold test uses the
+     scroll's own holdTarget, not the damped hold, which lags into the band.
+     Both the trigger and the idle callback also require the pair to sit exactly
+     at an endpoint (morph 0 or 1; remap clamps, so any band fraction below
+     morphStart reads exactly 0), so the upload can never land on the first
+     frames of a visible morph. The callback re-arms if that no longer holds.
+     `prefetchedFor` keeps it to once per held chapter. */
   maybePrefetch(live) {
-    if (live.index === this.prefetchedFor || live.t < 0.45 || Math.abs(live.velocity) > 2500) return;
-    this.prefetchedFor = live.index;
+    const k = live.settledIndex;
+    // live.index === k: the bound pair is (k, k + 1), so k + 1 is not the spare.
+    // A same-scene pair (stack -> hobbies) never morphs, so its band counts as a
+    // hold too; otherwise a short hold before it can be scrolled past unfetched.
+    const still = (s) => s.sceneA === s.sceneB || s.morph === 0 || s.morph === 1;
+    const resting = this.timeline.holdTarget > 0.5 || live.sceneA === live.sceneB;
+    if (k === this.prefetchedFor || live.index !== k || !resting || !still(live) || Math.abs(live.velocity) / this.designScale > 2500) return;
     const chapters = this.timeline.chapters;
-    const next = chapters[Math.min(live.index + 2, chapters.length - 1)];
+    const next = chapters[k + 2];
     if (!next) return;
+    this.prefetchedFor = k;
     schedule(() => {
       if (this.disposed) return;
+      const s = this.timeline.state;
+      if (s.index !== k || !still(s)) {
+        this.prefetchedFor = -1;
+        return;
+      }
       this.particles.prefetch(next.scene);
     });
   }
@@ -501,11 +899,23 @@ class WebGLExperience {
   // Idempotent, because it is also the visibilitychange handler: returning to a
   // backgrounded tab calls it whether or not the loop was actually stopped.
   // Clearing lastNow makes the first frame back compute a default dt instead of
-  // however long the tab was hidden.
+  // however long the tab was hidden, and the refresh clock forgets the gap
+  // across the pause. Before the programs are ready it only records the
+  // request; the prewarm starts the loop when they are.
   start() {
     if (this.running || this.disposed) return;
+    if (!this.ready) {
+      this.startWanted = true;
+      return;
+    }
+    this.startWanted = false;
     this.running = true;
     this.lastNow = 0;
+    this.vsyncClock.restart();
+    this.dirty = true;
+    // Whatever the camera did while the loop was stopped, the first frame back
+    // is not a continuation of the last one it drew.
+    this.post.invalidateMotion();
     // Bound once and cached. A fresh closure per frame would be garbage, and
     // cancelAnimationFrame needs a stable reference.
     this._frame = this._frame || ((now) => this.frame(now));
@@ -513,6 +923,7 @@ class WebGLExperience {
   }
 
   stop() {
+    this.startWanted = false;
     this.running = false;
     if (this.raf) cancelAnimationFrame(this.raf);
     this.raf = 0;
@@ -533,6 +944,11 @@ class WebGLExperience {
     removeEventListener('pageshow', this._onVisibility);
     document.removeEventListener('visibilitychange', this._onVisibility);
     this.canvas.removeEventListener('webglcontextlost', this._onContextLost);
+    if (this._boxObserver) this._boxObserver.disconnect();
+    if (this._variantObserver) this._variantObserver.disconnect();
+    // Puts the authored hero and contact back and lets the photo return.
+    this.stagePortrait(false);
+    this.timeline.dispose();
     this.pointer.dispose();
     this.particles.dispose();
     this.post.dispose();
@@ -606,7 +1022,16 @@ function enable() {
   if (dom && typeof dom.destroy === 'function') dom.destroy();
 
   try {
-    experience = new WebGLExperience(canvas, { reduced, debug: flag === 'debug' });
+    const created = new WebGLExperience(canvas, {
+      reduced,
+      debug: flag === 'debug',
+      // A failure after construction (the asynchronous prewarm) takes the same
+      // exit as a thrown constructor, unless the console has moved on.
+      onFail: () => {
+        if (experience === created) disable();
+      },
+    });
+    experience = created;
     experience.start();
     if (flag === 'debug') {
       import('./debug.js')
