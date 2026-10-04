@@ -42,8 +42,13 @@ export const DEFAULTS = Object.freeze({
   pinch: 0,
   // A transition key: how far (world units) particles puff out along their
   // own random directions mid-flight, so a formation comes apart as an even
-  // cloud (the portrait, chapters.js PORTRAIT).
+  // cloud.
   scatter: 0,
+  // A transition key: the portrait's erosion (lib/modes.js ERODE). Above 0 a
+  // ragged front crosses the departing formation from right to left in place
+  // of the seed timing (stagger, arc and scatter are then not read); 1 is the
+  // authored motion, lower is calmer.
+  erode: 0,
 
   // Glow means lit. bloomThreshold is the settled formation's lit-HDR p99: the
   // 99th percentile of the half-whitened largest channel over the raw
@@ -229,17 +234,19 @@ export const CHAPTERS = Object.freeze([
     haze: 0, hazeMix: 0.3, temp: -0.05, sat: 0.95, exposure: 1.9,
     portrait: {
       ...PORTRAIT,
-      /* The face comes apart at once and evenly: the band starts on the first
-         pixel of scroll (hold 0) and is over by about half a screen, every
-         particle leaves within the first 40% of it (stagger 0.4) and puffs
-         out along its own random direction (scatter), so the face turns into
-         an even cloud of dust instead of sliding toward the program as a
-         whole; a low arc keeps the cloud from swinging. The camera waits for
-         the first 30% (camDelay), so it comes apart in place. No hold push:
-         the fit is exact at scroll 0. */
+      /* The face is eroded from right to left (erode, lib/modes.js ERODE):
+         the band starts on the first pixel of scroll (hold 0) and is read
+         over about a screen, like the hero's own. A ragged front crosses the
+         face in the first half of the morph; where it passes, the points
+         loosen and are pulled away to the right, and the stream carries them
+         on to the program, which condenses left to right as they land. Ahead
+         of the front the face holds still, so it reads as the portrait until
+         the front gets there. The camera waits for the first 40% of the band
+         (camDelay), so the face is eroded where it was and the camera then
+         follows the stream. No hold push: the fit is exact at scroll 0. */
       knobs: {
-        band: { hold: 0, arrive: 0.45, maxLen: 0.7, idealLen: 0.55 },
-        morphStart: 0, morphEnd: 0.85, stagger: 0.4, scatter: 5, arc: 1.2, camDelay: 0.3, holdPush: 0,
+        band: { hold: 0, arrive: -0.1, maxLen: 1.1, idealLen: 1.0 },
+        morphStart: 0, morphEnd: 0.85, erode: 1, camDelay: 0.4, holdPush: 0,
         pulse: 0.08, pulseRate: 0.06, pulseWidth: 1.0, bloomThreshold: 5, exposure: 1.9,
       },
     },
@@ -373,8 +380,8 @@ export const REDUCED_CHAPTERS = Object.freeze([
     portrait: {
       ...PORTRAIT,
       knobs: {
-        band: { hold: 0, arrive: 0.45, maxLen: 0.7, idealLen: 0.55 },
-        morphStart: 0, morphEnd: 0.85, stagger: 0.5, scatter: 2.5, camDelay: 0.3,
+        band: { hold: 0, arrive: -0.1, maxLen: 1.1, idealLen: 1.0 },
+        morphStart: 0, morphEnd: 0.85, erode: 0.5, camDelay: 0.4,
         pulse: 0.05, pulseWidth: 1.0, bloomThreshold: 6,
       },
     },
