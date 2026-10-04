@@ -577,3 +577,54 @@ export const AVATAR = Object.freeze({
   plane: 0.55,
   rock: 0.04,
 });
+
+/* ── The portrait's erosion (shaders/particles.js main(), step 1b) ─────────
+
+   How the portrait leaves (chapters.js hero portrait `erode`): a ragged front
+   crosses the face from its right edge to its left; where it passes, the
+   points loosen, are pulled away to the right and are carried in strands to
+   their own places in the next formation, which condenses left to right as
+   they land. Nothing is faded out on the way. Where the front starts, how far
+   it travels and the box the next formation condenses over are measured from
+   the formations themselves (particle-system.js _erodeBox). Distances in
+   world units, times in shares of the morph.
+
+   sweep        how long the front takes to cross: it sets off on the first
+                pixel of scroll from each row's own right edge, slowly, and
+                gathers pace
+   edge, grain  how far the edge noise moves it (a share of the width) and the
+                noise's frequency (per unit): a ragged edge with tongues
+   jitter       how far each point's own seed moves it (a share of the width)
+   loosen       how long a point trembles at the boundary before it goes
+   tremble      how far it trembles, with the patch round it
+   lift         how far it lifts toward the camera as it loosens
+   glint        how much light it catches as it goes
+   pull         how far it is first pulled to the right
+   via, keep    the stream's waypoint, a share of the way from the portrait's
+                centre to the next formation's, and how much of the face's
+                layout the stream keeps there
+   swirl        how far the stream's own field bends it in flight
+   dim          how much dimmer a point is mid-flight
+   landFrom,    when the next formation's first and last points land; in
+   landTo       between it condenses left to right, a little top to bottom
+   flightMin,   the shortest and the longest flight: no point lands sooner or
+   flightMax    later than these after it goes */
+export const ERODE = Object.freeze({
+  sweep: 0.52,
+  edge: 0.09,
+  grain: 0.3,
+  jitter: 0.015,
+  loosen: 0.03,
+  tremble: 0.07,
+  lift: 0.5,
+  glint: 0.35,
+  pull: 2.2,
+  via: 0.5,
+  keep: 0.7,
+  swirl: 1.1,
+  dim: 0.5,
+  landFrom: 0.36,
+  landTo: 0.97,
+  flightMin: 0.28,
+  flightMax: 0.7,
+});
